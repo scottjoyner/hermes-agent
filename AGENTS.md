@@ -67,6 +67,43 @@ hermes-agent/
 `gateway.log` when running the gateway. Profile-aware via `get_hermes_home()`.
 Browse with `hermes logs [--follow] [--level ...] [--session ...]`.
 
+## NAS Management Skill
+
+The NAS management skill provides comprehensive management capabilities for the NAS system:
+
+```
+skills/nas-management/
+├── SKILL.md              # Main skill documentation
+├── README.md             # Comprehensive documentation
+├── references/
+│   └── integration-patterns.md  # Integration patterns reference
+├── templates/
+│   └── nas-config-template.md   # Configuration templates
+└── scripts/
+    ├── nas-health-check.sh  # Health check script
+    └── nas-watcher.py       # Auto-ingest watcher script
+```
+
+### Key Features
+
+- Health monitoring and diagnostics
+- Automated backup strategies (daily/weekly)
+- Docker service integration patterns
+- Auto-ingest pipeline for file processing
+- Neo4j graph database integration
+- Nextcloud file sharing integration
+- Signal CLI data management
+- Security hardening guidelines
+
+### Usage
+
+When working with NAS-related tasks, load the skill with:
+```bash
+hermes skill view nas-management
+```
+
+Or reference it in cron jobs and subagent tasks for automated NAS management.
+
 ## File Dependency Chain
 
 ```
