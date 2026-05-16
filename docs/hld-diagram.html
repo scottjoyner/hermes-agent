@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Hermes Agent System - High Level Design Diagram</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            margin: 0;
+            padding: 20px;
+            background: #1e1e1e;
+            color: #d4d4d4;
+        }
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+        h1 {
+            text-align: center;
+            color: #569cd6;
+            margin-bottom: 30px;
+        }
+        .diagram {
+            background: #252526;
+            border: 1px solid #3e3e42;
+            border-radius: 8px;
+            padding: 20px;
+            margin-bottom: 20px;
+        }
+        .layer {
+            margin-bottom: 20px;
+        }
+        .layer-title {
+            font-size: 18px;
+            font-weight: bold;
+            color: #4ec9b0;
+            margin-bottom: 10px;
+            padding: 5px 10px;
+            background: #2d2d30;
+            border-radius: 4px;
+        }
+        .component {
+            display: inline-block;
+            margin: 5px;
+            padding: 10px 15px;
+            background: #333337;
+            border: 1px solid #44444c;
+            border-radius: 4px;
+            font-size: 14px;
+        }
+        .component:hover {
+            background: #3e3e42;
+        }
+        .nas {
+            background: #2d4a3e;
+            border-color: #4ec9b0;
+        }
+        .docker {
+            background: #2d3a4a;
+            border-color: #569cd6;
+        }
+        .service {
+            background: #3a2d4a;
+            border-color: #c586c0;
+        }
+        .agent {
+            background: #4a3a2d;
+            border-color: #dcdcaa;
+        }
+        .external {
+            background: #2d4a4a;
+            border-color: #4ec9b0;
+        }
+        .arrow {
+            text-align: center;
+            font-size: 20px;
+            color: #808080;
+            margin: 10px 0;
+        }
+        .description {
+            background: #2d2d30;
+            border-left: 4px solid #569cd6;
+            padding: 10px 15px;
+            margin: 10px 0;
+            border-radius: 0 4px 4px 0;
+        }
+        .legend {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+            margin: 20px 0;
+        }
+        .legend-item {
+            display: flex;
+            align-items: center;
+            gap: 5px;
+        }
+        .legend-color {
+            width: 20px;
+            height: 20px;
+            border-radius: 4px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Hermes Agent System - High Level Design Diagram</h1>
+        
+        <div class="legend">
+            <div class="legend-item">
+                <div class="legend-color" style="background: #4ec9b0;"></div>
+                <span>NAS/Storage</span>
+            </div>
+            <div class="legend-item">
+                <div class="legend-color" style="background: #569cd6;"></div>
+                <span>Docker Services</span>
+            </div>
+            <div class="legend-item">
+                <div class="legend-color" style="background: #c586c0;"></div>
+                <span>Applications</span>
+            </div>
+            <div class="legend-item">
+                <div class="legend-color" style="background: #dcdcaa;"></div>
+                <span>Agent System</span>
+            </div>
+            <div class="legend-item">
+                <div class="legend-color" style="background: #4ec9b0;"></div>
+                <span>External Services</span>
+            </div>
+        </div>
+
+        <div class="diagram">
+            <div class="layer">
+                <div class="layer-title">External Services</div>
+                <div class="component external">Signal CLI</div>
+                <div class="component external">Neo4j Graph DB</div>
+                <div class="component external">Nextcloud</div>
+                <div class="component external">GitHub</div>
+                <div class="component external">OpenRouter</div>
+                <div class="component external">LM Studio</div>
+            </div>
+            
+            <div class="arrow">↓ ↑</div>
+            
+            <div class="layer">
+                <div class="layer-title">Network Layer</div>
+                <div class="component docker">Nginx Reverse Proxy</div>
+                <div class="component docker">Tailscale Network</div>
+                <div class="component docker">Firewall (UFW)</div>
+            </div>
+            
+            <div class="arrow">↓ ↑</div>
+            
+            <div class="layer">
+                <div class="layer-title">Docker Services</div>
+                <div class="component docker">Neo4j</div>
+                <div class="component docker">Nextcloud</div>
+                <div class="component docker">Signal CLI REST API</div>
+                <div class="component docker">Redis</div>
+                <div class="component docker">PostgreSQL</div>
+                <div class="component docker">Nginx</div>
+            </div>
+            
+            <div class="arrow">↓ ↑</div>
+            
+            <div class="layer">
+                <div class="layer-title">Storage Layer (NAS)</div>
+                <div class="component nas">/media/scott/NAS/fileserver</div>
+                <div class="component nas">Backups (Daily/Weekly)</div>
+                <div class="component nas">Bodycam Data</div>
+                <div class="component nas">Dashcam Data</div>
+                <div class="component nas">Audio Data</div>
+                <div class="component nas">Docker Volumes</div>
+            </div>
+            
+            <div class="arrow">↓ ↑</div>
+            
+            <div class="layer">
+                <div class="layer-title">Agent System</div>
+                <div class="component agent">Hermes Agent Core</div>
+                <div class="component agent">Skill Management</div>
+                <div class="component agent">Auto-Ingest Pipeline</div>
+                <div class="component agent">Health Monitoring</div>
+                <div class="component agent">Git Integration</div>
+            </div>
+        </div>
+
+        <div class="description">
+            <h3>System Architecture Notes</h3>
+            <ul>
+                <li><strong>NAS:</strong> Primary storage device mounted at /media/scott/NAS/fileserver with exfat filesystem</li>
+                <li><strong>Docker Services:</strong> Containerized services managed via docker-compose</li>
+                <li><strong>Agent System:</strong> Hermes Agent core with skill management and automation capabilities</li>
+                <li><strong>Integration:</strong> Services integrate through bind mounts, APIs, and shared storage</li>
+                <li><strong>Security:</strong> Firewall rules, Docker security options, and Tailscale network isolation</li>
+            </ul>
+        </div>
+    </div>
+</body>
+</html>
