@@ -34,6 +34,8 @@ cd "$SCRIPT_DIR"
 export UV_NO_CONFIG=1
 
 PYTHON_VERSION="3.11"
+LMS_PORT="${HERMES_LMS_PORT:-1234}"
+LMS_BASE_URL="http://127.0.0.1:${LMS_PORT}/v1"
 
 is_termux() {
     [ -n "${TERMUX_VERSION:-}" ] || [[ "${PREFIX:-}" == *"com.termux/files/usr"* ]]
@@ -52,6 +54,145 @@ get_command_link_display_dir() {
         echo '$PREFIX/bin'
     else
         echo '~/.local/bin'
+    fi
+}
+
+lms_endpoint_ready() {
+    if ! command -v curl >/dev/null 2>&1; then
+        return 1
+    fi
+    curl -fsS --max-time 5 "${LMS_BASE_URL}/models" >/dev/null 2>&1
+}
+
+detect_lms_model() {
+    # Caller can always force a specific model:
+    #   HERMES_LMS_MODEL=<model-id> ./setup-hermes.sh
+    if [ -n "${HERMES_LMS_MODEL:-}" ]; then
+        echo "$HERMES_LMS_MODEL"
+        return 0
+    fi
+
+    local os_name arch mem_gb
+    os_name="$(uname -s 2>/dev/null || echo unknown)"
+    arch="$(uname -m 2>/dev/null || echo unknown)"
+    mem_gb=0
+
+    case "$os_name" in
+        Darwin)
+            mem_gb=$(( $(sysctl -n hw.memsize 2>/dev/null || echo 0) / 1024 / 1024 / 1024 ))
+            if [[ "$arch" == "arm64" ]]; then
+                if [ "$mem_gb" -ge 64 ]; then
+                    echo "qwen3.6-35b-a3b"
+                elif [ "$mem_gb" -ge 32 ]; then
+                    echo "qwen3.5-27b"
+                elif [ "$mem_gb" -ge 12 ]; then
+                    echo "qwen3.5-9b"
+                elif [ "$mem_gb" -ge 8 ]; then
+                    echo "qwen3.5-2b"
+                else
+                    echo "qwen3.5-0.8b"
+                fi
+                return 0
+            fi
+            ;;
+        Linux)
+            mem_gb=$(( $(awk '/MemTotal/ {print $2}' /proc/meminfo 2>/dev/null || echo 0) / 1024 / 1024 ))
+            if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then
+                if [ "$mem_gb" -ge 64 ]; then
+                    echo "qwen3.6-35b-a3b"
+                elif [ "$mem_gb" -ge 32 ]; then
+                    echo "qwen3.5-27b"
+                else
+                    echo "qwen3.5-9b"
+                fi
+                return 0
+            fi
+            ;;
+    esac
+
+    if [ "$mem_gb" -ge 64 ]; then
+        echo "qwen3.6-35b-a3b"
+    elif [ "$mem_gb" -ge 32 ]; then
+        echo "qwen3.5-27b"
+    elif [ "$mem_gb" -ge 12 ]; then
+        echo "qwen3.5-9b"
+    elif [ "$mem_gb" -ge 8 ]; then
+        echo "qwen3.5-2b"
+    else
+        echo "qwen3.5-0.8b"
+    fi
+}
+
+setup_lmstudio_local_endpoint() {
+    if is_termux; then
+        echo -e "${CYAN}→${NC} Skipping LM Studio setup on Termux"
+        return 0
+    fi
+
+    echo ""
+    if [ ! -t 0 ]; then
+        echo -e "${CYAN}→${NC} Non-interactive session detected; skipping optional LM Studio setup prompt."
+        return 0
+    fi
+    read -p "Use LM Studio local endpoint for Hermes on this machine? [y/N] " -n 1 -r
+    echo
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        return 0
+    fi
+
+    if lms_endpoint_ready; then
+        echo -e "${GREEN}✓${NC} LM Studio endpoint already available at ${LMS_BASE_URL}"
+    else
+        if ! command -v lms >/dev/null 2>&1; then
+            echo -e "${CYAN}→${NC} Installing LM Studio CLI (llmster + lms)..."
+            if curl -fsSL https://lmstudio.ai/install.sh | bash; then
+                echo -e "${GREEN}✓${NC} LM Studio CLI installer completed"
+            else
+                echo -e "${YELLOW}⚠${NC} LM Studio CLI install failed. Configure manually and re-run setup-hermes.sh."
+                return 0
+            fi
+            # shellcheck disable=SC1090
+            [ -f "$HOME/.bashrc" ] && . "$HOME/.bashrc" 2>/dev/null || true
+            [ -f "$HOME/.zshrc" ] && . "$HOME/.zshrc" 2>/dev/null || true
+        fi
+
+        if ! command -v lms >/dev/null 2>&1; then
+            echo -e "${YELLOW}⚠${NC} lms command still not on PATH. Open a new shell and run setup again."
+            return 0
+        fi
+
+        echo -e "${CYAN}→${NC} Starting LM Studio daemon..."
+        lms daemon up >/dev/null 2>&1 || true
+
+        local model_id
+        model_id="$(detect_lms_model)"
+        echo -e "${CYAN}→${NC} Ensuring model is downloaded: ${model_id}"
+        if ! lms get "$model_id" >/dev/null 2>&1; then
+            local fallback_model
+            fallback_model="${HERMES_LMS_FALLBACK_MODEL:-gpt-oss}"
+            echo -e "${YELLOW}⚠${NC} Could not auto-download ${model_id}; trying fallback model ${fallback_model}."
+            lms get "$fallback_model" >/dev/null 2>&1 || echo -e "${YELLOW}⚠${NC} Could not auto-download fallback model ${fallback_model}; continuing."
+        fi
+
+        echo -e "${CYAN}→${NC} Starting LM Studio API endpoint on port ${LMS_PORT}..."
+        lms server start --port "${LMS_PORT}" >/dev/null 2>&1 || true
+    fi
+
+    if lms_endpoint_ready; then
+        echo -e "${GREEN}✓${NC} LM Studio endpoint verified at ${LMS_BASE_URL}"
+        if [ -f ".env" ] && ! grep -q '^HERMES_LMS_BASE_URL=' ".env" 2>/dev/null; then
+            {
+                echo ""
+                echo "# Local LM Studio endpoint configured by setup-hermes.sh"
+                echo "HERMES_LMS_BASE_URL=${LMS_BASE_URL}"
+            } >> .env
+            echo -e "${GREEN}✓${NC} Wrote HERMES_LMS_BASE_URL to .env"
+        fi
+    else
+        echo -e "${YELLOW}⚠${NC} LM Studio endpoint is not reachable at ${LMS_BASE_URL}"
+        echo "    Check status with: lms status"
+        echo "    Start daemon with: lms daemon up"
+        echo "    Start API with:    lms server start --port ${LMS_PORT}"
     fi
 }
 
@@ -125,6 +266,9 @@ else
         fi
     fi
 fi
+
+# Optional LM Studio local endpoint workflow
+setup_lmstudio_local_endpoint
 
 # ============================================================================
 # Python check (uv can provision it automatically)
