@@ -13,7 +13,7 @@ from pathlib import Path
 from datetime import datetime
 
 # Configuration
-NAS_PATH = "/media/scott/NAS/fileserver"
+NAS_PATH = os.environ.get("NAS_PATH", "/media/scott/NAS2/fileserver")
 WATCH_DIRS = ["bodycam", "dashcam", "audio"]
 LOG_FILE = "/var/log/nas-watcher.log"
 STATE_FILE = "/tmp/nas-watcher-state.json"

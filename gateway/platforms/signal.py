@@ -331,7 +331,12 @@ class SignalAdapter(BasePlatformAdapter):
 
     async def _sse_listener(self) -> None:
         """Listen for SSE events from signal-cli daemon."""
-        url = f"{self.http_url}/api/v1/events?account={quote(self.account, safe='')}"
+        # signal-cli 0.14.x native HTTP daemon accepts the registered E.164
+        # phone number on the SSE stream.  Older local notes used the numeric
+        # config path with account=..., but that produces 400s / account lookup
+        # failures on this host.  Keep JSON-RPC params as account=self.account
+        # (also the E.164 number here), but subscribe with number= for receive.
+        url = f"{self.http_url}/api/v1/events?number={quote(self.account, safe='')}"
         backoff = SSE_RETRY_DELAY_INITIAL
 
         while self._running:

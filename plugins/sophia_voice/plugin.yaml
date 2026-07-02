@@ -1,0 +1,10 @@
+name: sophia_voice
+version: 0.1.0
+description: "Sophia voice sidecar integration for Hermes dashboard and agents."
+author: Hermes Agent
+kind: backend
+provides_tools:
+  - sophia_voice_status
+  - sophia_voice_intent
+  - sophia_voice_chat
+  - sophia_voice_events

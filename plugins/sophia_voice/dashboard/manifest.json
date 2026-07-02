@@ -1,0 +1,13 @@
+{
+  "name": "sophia_voice",
+  "label": "Sophia Voice",
+  "description": "Voice sidecar status, intent routing, and transcript chat for Hermes.",
+  "icon": "Mic",
+  "version": "0.1.0",
+  "tab": {
+    "path": "/sophia-voice",
+    "position": "after:chat"
+  },
+  "entry": "dist/index.js",
+  "api": "plugin_api.py"
+}
