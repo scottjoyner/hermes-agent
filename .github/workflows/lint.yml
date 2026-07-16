@@ -200,3 +200,24 @@ jobs:
 
       - name: Run footgun checker
         run: python scripts/check-windows-footguns.py --all
+
+  config-example-check:
+    # LLD W-84: ensure cli-config.yaml.example keys exist in DEFAULT_CONFIG so
+    # the three config loaders cannot silently diverge.
+    name: config example vs DEFAULT_CONFIG (W-84 drift gate)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v5
+        with:
+          python-version: "3.11"
+
+      - name: Install PyYAML
+        run: python -m pip install --quiet "pyyaml>=6.0,<7"
+
+      - name: Validate example config against DEFAULT_CONFIG
+        run: python scripts/validate_config_example.py

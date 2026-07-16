@@ -463,6 +463,29 @@ def load_cli_config() -> Dict[str, Any]:
             "seen": {},
         },
     }
+
+    # W-84: base the CLI defaults on the canonical DEFAULT_CONFIG so the CLI
+    # loader and hermes_cli/config.py's loader can no longer silently diverge.
+    # CLI-specific keys below win over DEFAULT_CONFIG; missing shared keys are
+    # filled in from DEFAULT_CONFIG. Behavior is otherwise unchanged.
+    try:
+        from config.loader import get_default_config
+
+        _canon = get_default_config()
+
+        def _deep_update(base: dict, overrides: dict) -> dict:
+            for k, v in overrides.items():
+                if isinstance(v, dict) and isinstance(base.get(k), dict):
+                    _deep_update(base[k], v)
+                else:
+                    base[k] = v
+            return base
+
+        _deep_update(_canon, defaults)
+        defaults = _canon
+    except Exception:
+        # If the facade is unavailable, keep using the CLI's own defaults.
+        pass
     
     # Track whether the config file explicitly set terminal config.
     # When using defaults (no config file / no terminal section), we should NOT
