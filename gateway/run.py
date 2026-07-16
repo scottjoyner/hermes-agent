@@ -8,9 +8,26 @@ This module provides:
 Usage:
     # Start the gateway
     python -m gateway.run
-    
+
     # Or from CLI
     python cli.py --gateway
+
+=============================================================================
+REMEDIATION NOTE (LLD W-77)
+=============================================================================
+This file is ~18,500 LOC and was NOT documented in AGENTS.md. It is the
+central gateway runtime: it owns the GatewayRunner lifecycle (startup /
+shutdown / signal handling), per-platform adapter orchestration, the
+agent-per-session cache, message routing/dispatch, cron integration, and
+status reporting.
+
+It is too large to split safely in a single pass. Extraction is phased:
+  * gateway/status.py        — status-message helpers (extracted)
+  * (TODO) gateway/lifecycle.py — startup/shutdown orchestration
+  * (TODO) gateway/dispatch.py  — message routing/dispatch
+See gateway/README.md for the full extraction plan and per-phase TODOs.
+New code should live in the extracted submodules; run.py re-imports them to
+preserve existing behavior.
 """
 
 # IMPORTANT: hermes_bootstrap must be the very first import — UTF-8 stdio
@@ -302,33 +319,13 @@ def _sanitize_gateway_final_response(platform: Any, text: str) -> str:
     return redacted
 
 
-def _prepare_gateway_status_message(platform: Any, event_type: str, message: str) -> Optional[str]:
-    """Filter/sanitize agent status callbacks before platform delivery."""
-    text = str(message or "").strip()
-    if not text:
-        return None
-    if _gateway_platform_value(platform) != "telegram":
-        return text
-
-    text = _redact_gateway_user_facing_secrets(text)
-    if _TELEGRAM_NOISY_STATUS_RE.search(text):
-        return None
-    if _looks_like_gateway_provider_error(text):
-        return _gateway_provider_error_reply(text)
-    return text
-
-
-async def _send_or_update_status_coro(adapter, chat_id, status_key, content, metadata):
-    """Route a status message through adapter.send_or_update_status when supported.
-
-    Issue #30045: adapters that implement send_or_update_status (currently
-    Telegram) edit the previous bubble for the same status_key instead of
-    appending a new one. Adapters without the method fall back to plain send.
-    """
-    sender = getattr(adapter, "send_or_update_status", None)
-    if callable(sender):
-        return await sender(chat_id, status_key, content, metadata=metadata)
-    return await adapter.send(chat_id, content, metadata=metadata)
+# NOTE (W-77): status-message helpers extracted to gateway/status.py to begin
+# the phased decomposition of this module. Re-imported so call sites are
+# unchanged.
+from gateway.status import (
+    _prepare_gateway_status_message,
+    _send_or_update_status_coro,
+)
 
 
 def _telegramize_command_mentions(text: str, platform: Any) -> str:

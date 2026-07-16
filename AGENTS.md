@@ -21,19 +21,21 @@ entry points you'll actually edit.
 
 ```
 hermes-agent/
-├── run_agent.py          # AIAgent class — core conversation loop (~12k LOC)
+├── run_agent.py          # AIAgent class — core conversation loop (~4.4k LOC)
 ├── model_tools.py        # Tool orchestration, discover_builtin_tools(), handle_function_call()
 ├── toolsets.py           # Toolset definitions, _HERMES_CORE_TOOLS list
-├── cli.py                # HermesCLI class — interactive CLI orchestrator (~11k LOC)
+├── cli.py                # HermesCLI class — interactive CLI orchestrator (~15k LOC)
 ├── hermes_state.py       # SessionDB — SQLite session store (FTS5 search)
 ├── hermes_constants.py   # get_hermes_home(), display_hermes_home() — profile-aware paths
 ├── hermes_logging.py     # setup_logging() — agent.log / errors.log / gateway.log (profile-aware)
 ├── batch_runner.py       # Parallel batch processing
 ├── agent/                # Agent internals (provider adapters, memory, caching, compression, etc.)
-├── hermes_cli/           # CLI subcommands, setup wizard, plugins loader, skin engine
+├── hermes_cli/           # CLI subcommands, setup wizard, plugins loader, skin engine (main.py ~14k LOC)
+├── agent/factory.py      # make_agent(config, platform, **overrides) — single AIAgent construction path (W-79)
+├── config/loader.py      # Unified config facade + cli-config example drift gate (W-84)
 ├── tools/                # Tool implementations — auto-discovered via tools/registry.py
 │   └── environments/     # Terminal backends (local, docker, ssh, modal, daytona, singularity)
-├── gateway/              # Messaging gateway — run.py + session.py + platforms/
+├── gateway/              # Messaging gateway — run.py (~18.5k LOC) + session.py + platforms/
 │   ├── platforms/        # Adapter per platform (telegram, discord, slack, whatsapp,
 │   │                     #   homeassistant, signal, matrix, mattermost, email, sms,
 │   │                     #   dingtalk, wecom, weixin, feishu, qqbot, bluebubbles,

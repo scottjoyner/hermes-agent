@@ -1699,45 +1699,13 @@ _LIGHT_MODE_REMAP: dict[str, str] = {
 }
 
 
-def _maybe_remap_for_light_mode(hex_color: str) -> str:
-    """If we're in light mode, remap a dark-mode-tuned color to a
-    higher-contrast equivalent.  No-op in dark mode."""
-    if not _detect_light_mode():
-        return hex_color
-    if not hex_color or not hex_color.startswith("#"):
-        return hex_color
-    # Case-insensitive lookup
-    upper = hex_color.upper()
-    if upper in _LIGHT_MODE_REMAP_UPPER:
-        return _LIGHT_MODE_REMAP_UPPER[upper]
-    return hex_color
-
-
-# Pre-uppercased lookup table for case-insensitive remapping
-_LIGHT_MODE_REMAP_UPPER = {k.upper(): v for k, v in _LIGHT_MODE_REMAP.items()}
-
-
-def _install_skin_light_mode_hook() -> None:
-    """Wrap SkinConfig.get_color at import time so EVERY skin color read goes
-    through the light-mode remap.  Idempotent."""
-    try:
-        from hermes_cli.skin_engine import SkinConfig  # type: ignore[import]
-    except Exception:
-        return
-    if getattr(SkinConfig, "_hermes_light_mode_hook_installed", False):
-        return
-    _orig_get_color = SkinConfig.get_color
-
-    def _wrapped_get_color(self, key, fallback=""):
-        value = _orig_get_color(self, key, fallback)
-        try:
-            return _maybe_remap_for_light_mode(value)
-        except Exception:
-            return value
-
-    SkinConfig.get_color = _wrapped_get_color  # type: ignore[method-assign]
-    SkinConfig._hermes_light_mode_hook_installed = True  # type: ignore[attr-defined]
-
+# NOTE (W-78): light-mode color remapping helpers extracted to
+# hermes_cli/colors.py to continue the phased decomposition of cli.py.
+# Re-imported so call sites and behavior are unchanged.
+from hermes_cli.colors import (
+    _maybe_remap_for_light_mode,
+    _install_skin_light_mode_hook,
+)
 
 _install_skin_light_mode_hook()
 
