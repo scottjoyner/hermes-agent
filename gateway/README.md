@@ -26,7 +26,7 @@ split in one pass, so extraction is **phased**:
 | Submodule | Responsibility | Status |
 |-----------|----------------|--------|
 | `gateway/status.py` | Status-message helpers (`_prepare_gateway_status_message`, `_send_or_update_status_coro`) | ✅ extracted (W-77) |
-| `gateway/lifecycle.py` | startup/shutdown/signal orchestration | TODO |
+| `gateway/lifecycle.py` | Module-level lifecycle helpers (`_gateway_loop_exception_handler`, `_ensure_ssl_certs`, `_reload_runtime_env_preserving_config_authority`, `_start_cron_ticker`) | ✅ extracted (W-77) |
 | `gateway/dispatch.py` | message routing + command dispatch | TODO |
 | `gateway/session.py` | session store / agent cache | exists (separate file) |
 
