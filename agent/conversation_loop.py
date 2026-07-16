@@ -4262,6 +4262,15 @@ def run_conversation(
         original_user_message=original_user_message,
         final_response=final_response,
         interrupted=interrupted,
+        turn={
+            "session_id": agent.session_id or "",
+            "user_message": original_user_message,
+            "assistant_response": final_response,
+            "messages": list(messages),
+            "interrupted": interrupted,
+            "platform": getattr(agent, "platform", None) or "",
+            "agent_context": getattr(agent, "agent_context", None) or "",
+        },
     )
 
     # Background memory/skill review — runs AFTER the response is delivered

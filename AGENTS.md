@@ -782,6 +782,33 @@ Synchronicity rule: delegate_task is **not** durable. For long-running
 work that must outlive the current turn, use `cronjob` or
 `terminal(background=True, notify_on_complete=True)` instead.
 
+### Return contract (best practice for triggered sub-agents)
+
+`delegate_task` returns the child's final message to the parent as a
+**summary**. For sub-agents whose result is *machine-consumed* — especially
+`provider="opencode-cli"` (a real `opencode` CLI session) or any triggered
+sub-agent where the caller needs the exact value back — a prose summary is
+not enough. Set `return_format` on the delegation so the function caller gets
+the right information back:
+
+- `return_format="verbatim"` — child returns ONLY the raw result value
+  (no preamble/markdown/fences). Use when the parent needs the exact token
+  (e.g. "Reply with exactly the word PONG" → parent receives `PONG`).
+- `return_format="json"` — child returns a single `{"result": ..., "ok": true}`
+  object (no surrounding prose). Best for structured results.
+- `return_format="summary"` (default) — prose recap of what was done/found.
+  Fine for human-readable sub-agent work, but NOT for values the parent
+  must parse.
+
+Why this matters: without a return contract, an autonomous child (e.g.
+`opencode --auto`) may *act* on the goal (write a file, run a command) and
+report that it did so in prose, so the parent only gets a description of the
+result, not the result itself. The contract is injected into the child's
+system prompt as a `RETURN CONTRACT` block. Best practice: **always pin
+`return_format="verbatim"` or `"json"` whenever the delegated output feeds
+another tool, a comparison, or programmatic logic** — never rely on the
+parent LLM to extract a value from a summary.
+
 ---
 
 ## Curator (skill lifecycle)

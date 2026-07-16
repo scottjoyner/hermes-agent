@@ -1704,6 +1704,45 @@ def test_session_id_filters_listings(kanban_home):
     assert len(unscoped) == 4
 
 
+def test_create_task_stamps_assistx_task_id(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="assistx-linked", assistx_task_id="ax_789")
+        t = kb.get_task(conn, tid)
+    assert t is not None
+    assert t.assistx_task_id == "ax_789"
+
+
+def test_create_task_assistx_task_id_defaults_to_none(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="cli-created")
+        t = kb.get_task(conn, tid)
+    assert t is not None
+    assert t.assistx_task_id is None
+
+
+def test_migration_adds_assistx_task_id_column(kanban_home):
+    """Legacy DBs opened by init_db should get the column."""
+    with kb.connect() as conn:
+        cols = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)")}
+    assert "assistx_task_id" in cols
+
+
+def test_assistx_task_id_appears_in_task_summary_dict(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="summary-test", assistx_task_id="ax_sum_1")
+        t = kb.get_task(conn, tid)
+    d = t.__dict__ if hasattr(t, "__dict__") else {}
+    assert d.get("assistx_task_id") == "ax_sum_1"
+    assert t.assistx_task_id == "ax_sum_1"
+
+
+def test_assistx_task_id_is_null_for_tasks_without_it(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="no-assistx")
+        t = kb.get_task(conn, tid)
+    assert t.assistx_task_id is None
+
+
 def test_session_id_index_exists(kanban_home):
     """The migration creates an index on session_id for cheap per-session
     list queries on busy boards. Without it, a chat-scoped poll would

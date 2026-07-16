@@ -6191,6 +6191,13 @@ def cmd_kanban(args):
     return kanban_command(args)
 
 
+def cmd_auto_assign_worker(args):
+    """Poll and claim assignments from auto-assign."""
+    from hermes_cli.auto_assign_worker import auto_assign_worker_command
+
+    return auto_assign_worker_command(args)
+
+
 def cmd_hooks(args):
     """Shell-hook inspection and management."""
     from hermes_cli.hooks import hooks_command
@@ -10756,11 +10763,11 @@ def _build_provider_choices() -> list[str]:
 # to parse.
 _BUILTIN_SUBCOMMANDS = frozenset(
     {
-        "acp", "auth", "backup", "bundles", "checkpoints", "claw", "completion",
+        "acp", "auth", "auto-assign-worker", "backup", "bundles", "checkpoints", "claw", "completion",
         "computer-use",
         "config", "cron", "curator", "dashboard", "debug", "doctor",
         "dump", "fallback", "gateway", "hooks", "import", "insights",
-        "kanban", "login", "logout", "logs", "lsp", "mcp", "memory", "migrate",
+        "kanban", "knowledge-graph", "login", "logout", "logs", "lsp", "mcp", "memory", "migrate",
         "model", "pairing", "plugins", "portal", "postinstall", "profile", "proxy",
         "send", "sessions", "setup",
         "skills", "slack", "status", "tools", "uninstall", "update",
@@ -11995,6 +12002,14 @@ def main():
     kanban_parser.set_defaults(func=cmd_kanban)
 
     # =========================================================================
+    # auto-assign-worker command — poll and claim assignments from auto-assign
+    # =========================================================================
+    from hermes_cli.auto_assign_worker import build_parser as _build_aaw_parser
+
+    aaw_parser = _build_aaw_parser(subparsers)
+    aaw_parser.set_defaults(func=cmd_auto_assign_worker)
+
+    # =========================================================================
     # hooks command — shell-hook inspection and management
     # =========================================================================
     hooks_parser = subparsers.add_parser(
@@ -12696,6 +12711,30 @@ Examples:
         _register_curator_cli(curator_parser)
     except Exception as _exc:
         logging.getLogger(__name__).debug("curator CLI wiring failed: %s", _exc)
+
+    # =========================================================================
+    # knowledge-graph command — second-brain memory provider
+    # =========================================================================
+    kg_parser = subparsers.add_parser(
+        "knowledge-graph",
+        help="Knowledge-graph second brain — status, search, index-docs, ideas",
+        description=(
+            "Inspect and query the knowledge_graph memory provider: a Neo4j "
+            "second brain that captures sessions, chain-of-thought, tool calls, "
+            "and indexed docs as embeddable, linkable nodes.\n\n"
+            "Active when memory.provider = knowledge_graph."
+        ),
+    )
+    try:
+        from plugins.memory.knowledge_graph.cli import (
+            register_cli as _register_kg_cli,
+            knowledge_graph_command as _kg_command,
+        )
+
+        _register_kg_cli(kg_parser)
+        kg_parser.set_defaults(func=_kg_command)
+    except Exception as _exc:
+        logging.getLogger(__name__).debug("knowledge-graph CLI wiring failed: %s", _exc)
 
     # =========================================================================
     # memory command

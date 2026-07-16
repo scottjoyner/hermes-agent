@@ -142,6 +142,20 @@ class TestChildSystemPrompt(unittest.TestCase):
         prompt = _build_child_system_prompt("Do something", "  ")
         self.assertNotIn("CONTEXT", prompt)
 
+    def test_return_contract_verbatim_injects_instruction(self):
+        prompt = _build_child_system_prompt("Reply with PONG", return_format="verbatim")
+        self.assertIn("RETURN CONTRACT (verbatim)", prompt)
+        self.assertIn("ONLY the raw result", prompt)
+
+    def test_return_contract_json_injects_instruction(self):
+        prompt = _build_child_system_prompt("Compute x", return_format="json")
+        self.assertIn("RETURN CONTRACT (json)", prompt)
+        self.assertIn('"result"', prompt)
+
+    def test_return_contract_summary_has_no_contract(self):
+        prompt = _build_child_system_prompt("Do something", return_format="summary")
+        self.assertNotIn("RETURN CONTRACT", prompt)
+
 
 class TestStripBlockedTools(unittest.TestCase):
     def test_removes_blocked_toolsets(self):

@@ -574,6 +574,7 @@ def _build_child_system_prompt(
     role: str = "leaf",
     max_spawn_depth: int = 2,
     child_depth: int = 1,
+    return_format: str = "summary",
 ) -> str:
     """Build a focused system prompt for a child agent.
 
@@ -608,6 +609,30 @@ def _build_child_system_prompt(
         "Be thorough but concise -- your response is returned to the "
         "parent agent as a summary."
     )
+    # Output contract: when the caller needs the actual result value (not a
+    # prose summary) — e.g. delegating to a real opencode-cli session, or any
+    # triggered sub-agent whose return is machine-consumed — pin an exact
+    # return format so the parent can extract it reliably.  This is the
+    # "return contract" best practice for delegated/triggered agents.
+    if return_format == "verbatim":
+        parts.append(
+            "\nRETURN CONTRACT (verbatim):\n"
+            "Your FINAL message MUST contain ONLY the raw result value the "
+            "parent asked for — no preamble, no explanation, no markdown "
+            "fences, no 'Here is the answer'. Return the exact token/value "
+            "and nothing else."
+        )
+    elif return_format == "json":
+        parts.append(
+            "\nRETURN CONTRACT (json):\n"
+            "Your FINAL message MUST be a single valid JSON object (no "
+            "surrounding prose, no markdown fences) with the shape "
+            '{"result": <value>, "ok": true}. The parent parses this '
+            "programmatically."
+        )
+    elif return_format and return_format not in ("summary", "verbatim", "json"):
+        # Allow callers to specify a custom contract verbatim.
+        parts.append(f"\nRETURN CONTRACT:\n{return_format}")
     if role == "orchestrator":
         child_note = (
             "Your own children MUST be leaves (cannot delegate further) "
@@ -888,6 +913,11 @@ def _build_child_agent(
     # 'leaf' (default) cannot; 'orchestrator' retains the delegation
     # toolset subject to depth/kill-switch bounds applied below.
     role: str = "leaf",
+    # Output contract for the child's return. "summary" (default) asks for a
+    # prose recap; "verbatim"/"json" pin an exact machine-usable return so the
+    # parent can extract the real result (essential for opencode-cli and other
+    # triggered sub-agents whose output is consumed, not read).
+    return_format: str = "summary",
 ):
     """
     Build a child AIAgent on the main thread (thread-safe construction).
@@ -975,6 +1005,7 @@ def _build_child_agent(
         role=effective_role,
         max_spawn_depth=max_spawn,
         child_depth=child_depth,
+        return_format=return_format,
     )
     # Extract parent's API key so subagents inherit auth (e.g. Nous Portal).
     parent_api_key = getattr(parent_agent, "api_key", None)
@@ -1924,6 +1955,8 @@ def delegate_task(
     acp_command: Optional[str] = None,
     acp_args: Optional[List[str]] = None,
     role: Optional[str] = None,
+    provider: Optional[str] = None,
+    return_format: Optional[str] = None,
     parent_agent=None,
 ) -> str:
     """
@@ -2000,10 +2033,14 @@ def delegate_task(
     # Normalize to task list
     max_children = _get_max_concurrent_children()
     recovered_tasks, tasks_error = _recover_tasks_from_json_string(tasks)
-    if tasks_error:
-        return tool_error(tasks_error)
     if recovered_tasks is not None:
         tasks = recovered_tasks
+    elif tasks_error:
+        # A junk `tasks` string is only fatal when there is no usable `goal`.
+        # Flaky models sometimes fill `tasks` with prose while also providing a
+        # valid `goal`; in that case ignore the bad `tasks` and use `goal`.
+        if not (goal and isinstance(goal, str) and goal.strip()):
+            return tool_error(tasks_error)
 
     if tasks and isinstance(tasks, list):
         if len(tasks) > max_children:
@@ -2017,7 +2054,9 @@ def delegate_task(
         task_list = tasks
     elif goal and isinstance(goal, str) and goal.strip():
         task_list = [
-            {"goal": goal, "context": context, "toolsets": toolsets, "role": top_role}
+            {"goal": goal, "context": context, "toolsets": toolsets,
+             "role": top_role, "provider": provider,
+             "return_format": return_format or "summary"}
         ]
     else:
         return tool_error("Provide either 'goal' (single task) or 'tasks' (batch).")
@@ -2067,7 +2106,9 @@ def delegate_task(
                 max_iterations=effective_max_iter,
                 task_count=n_tasks,
                 parent_agent=parent_agent,
-                override_provider=creds["provider"],
+                override_provider=t.get("provider") or creds["provider"],
+                role=effective_role,
+                return_format=t.get("return_format") or "summary",
                 override_base_url=creds["base_url"],
                 override_api_key=creds["api_key"],
                 override_api_mode=creds["api_mode"],
@@ -2079,7 +2120,6 @@ def delegate_task(
                     if task_acp_args is not None
                     else (acp_args if acp_args is not None else creds.get("args"))
                 ),
-                role=effective_role,
             )
             # Override with correct parent tool names (before child construction mutated global)
             child._delegate_saved_tool_names = _parent_tool_names
@@ -2093,6 +2133,16 @@ def delegate_task(
         _i, _t, child = children[0]
         result = _run_single_child(0, _t["goal"], child, parent_agent)
         results.append(result)
+        try:
+            parent_agent._memory_manager.on_delegation(
+                task=_t["goal"],
+                result=result.get("summary", "") or "",
+                goal=_t["goal"],
+                context=_t.get("context") or "",
+                child_session_id=getattr(child, "session_id", ""),
+            )
+        except Exception:
+            pass
     else:
         # Batch -- run in parallel with per-task progress lines
         completed_count = 0
@@ -2225,9 +2275,16 @@ def delegate_task(
                     if entry["task_index"] < len(task_list)
                     else ""
                 )
+                _task_ctx = (
+                    task_list[entry["task_index"]].get("context")
+                    if entry["task_index"] < len(task_list)
+                    else ""
+                )
                 parent_agent._memory_manager.on_delegation(
                     task=_task_goal,
                     result=entry.get("summary", "") or "",
+                    goal=_task_goal,
+                    context=_task_ctx or "",
                     child_session_id=(
                         getattr(children[entry["task_index"]][2], "session_id", "")
                         if entry["task_index"] < len(children)
@@ -2718,6 +2775,15 @@ DELEGATE_TASK_SCHEMA = {
                             "items": {"type": "string"},
                             "description": f"Toolsets for this specific task. Available: {_TOOLSET_LIST_STR}. Use 'web' for network access, 'terminal' for shell, 'browser' for web interaction.",
                         },
+                        "provider": {
+                            "type": "string",
+                            "description": (
+                                "Provider to run this subagent on. Defaults to "
+                                "the parent's provider. Set to 'opencode-cli' to "
+                                "delegate the task to a real local opencode CLI "
+                                "session (opencode resolves its own tools/model)."
+                            ),
+                        },
                         "acp_command": {
                             "type": "string",
                             "description": (
@@ -2736,6 +2802,17 @@ DELEGATE_TASK_SCHEMA = {
                             "enum": ["leaf", "orchestrator"],
                             "description": "Per-task role override. See top-level 'role' for semantics.",
                         },
+                        "return_format": {
+                            "type": "string",
+                            "description": (
+                                "Output contract for the child's return. 'summary' "
+                                "(default) returns a prose recap. 'verbatim' returns "
+                                "ONLY the raw result value. 'json' returns a single "
+                                "{\"result\": ...} object. Use 'verbatim'/'json' when the "
+                                "parent must machine-parse the result (e.g. opencode-cli "
+                                "sub-agents whose output is consumed, not read)."
+                            ),
+                        },
                     },
                     "required": ["goal"],
                 },
@@ -2748,6 +2825,16 @@ DELEGATE_TASK_SCHEMA = {
                 "type": "string",
                 "enum": ["leaf", "orchestrator"],
                 "description": "(rebuilt at get_definitions() time)",
+            },
+            "return_format": {
+                "type": "string",
+                "description": (
+                    "Output contract for the child's return. 'summary' (default) "
+                    "returns a prose recap. 'verbatim' returns ONLY the raw result "
+                    "value. 'json' returns a single {\"result\": ...} object. Use "
+                    "'verbatim'/'json' when the parent must machine-parse the result "
+                    "(e.g. opencode-cli sub-agents whose output is consumed, not read)."
+                ),
             },
             "acp_command": {
                 "type": "string",
@@ -2769,6 +2856,15 @@ DELEGATE_TASK_SCHEMA = {
                     "Arguments for the ACP command (default: ['--acp', '--stdio']). "
                     "Only used when acp_command is set. "
                     "Leave empty unless acp_command is explicitly provided."
+                ),
+            },
+            "provider": {
+                "type": "string",
+                "description": (
+                    "Provider to run the subagent(s) on. Defaults to the parent's "
+                    "provider. Set to 'opencode-cli' to delegate to a real local "
+                    "opencode CLI session (opencode resolves its own tools/model "
+                    "internally); the result is returned as text to the parent."
                 ),
             },
         },
@@ -2793,6 +2889,8 @@ registry.register(
         acp_command=args.get("acp_command"),
         acp_args=args.get("acp_args"),
         role=args.get("role"),
+        provider=args.get("provider"),
+        return_format=args.get("return_format"),
         parent_agent=kw.get("parent_agent"),
     ),
     check_fn=check_delegate_requirements,

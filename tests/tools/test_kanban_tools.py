@@ -5,12 +5,15 @@ Verifies:
     zero kanban tools in its schema; a worker session sees the kanban set.
   - Each handler's happy path.
   - Error paths (missing required args, bad metadata type, etc).
+  - AssistX notification callbacks on complete/block.
 """
 from __future__ import annotations
 
 import json
 import os
+from unittest.mock import patch
 
+import httpx
 import pytest
 
 
@@ -1726,3 +1729,98 @@ def test_board_param_in_all_schemas():
         assert "board" not in schema["parameters"].get("required", []), (
             f"{schema['name']} marks board as required; must be optional"
         )
+
+
+# ---------------------------------------------------------------------------
+# AssistX notification helpers
+# ---------------------------------------------------------------------------
+
+
+@patch("tools.kanban_tools.httpx.Client")
+def test_notify_assistx_task_complete_happy(mock_client):
+    from tools.kanban_tools import _notify_assistx_task_complete
+
+    mock_resp = mock_client.return_value.__enter__.return_value.post.return_value
+    mock_resp.raise_for_status.return_value = None
+
+    with patch.dict(os.environ, {
+        "ASSISTX_BASE_URL": "http://assistx:8000",
+        "HERMES_PROFILE": "test-worker",
+    }):
+        _notify_assistx_task_complete(
+            assistx_task_id="ax_123",
+            status="DONE",
+            summary="completed successfully",
+            result={"kanban_task_id": "kt_456"},
+        )
+
+    mock_client.return_value.__enter__.return_value.post.assert_called_once()
+    call_url = mock_client.return_value.__enter__.return_value.post.call_args[0][0]
+    assert "/api/tasks/ax_123/complete" in call_url
+
+    call_body = mock_client.return_value.__enter__.return_value.post.call_args[1]["json"]
+    assert call_body["status"] == "DONE"
+    assert call_body["agent_id"] == "test-worker"
+    assert call_body["summary"] == "completed successfully"
+    assert call_body["result"] == {"kanban_task_id": "kt_456"}
+
+
+@patch("tools.kanban_tools.httpx.Client")
+def test_notify_assistx_task_block(mock_client):
+    from tools.kanban_tools import _notify_assistx_task_complete
+
+    mock_resp = mock_client.return_value.__enter__.return_value.post.return_value
+    mock_resp.raise_for_status.return_value = None
+
+    with patch.dict(os.environ, {
+        "ASSISTX_BASE_URL": "http://assistx:8000",
+    }):
+        _notify_assistx_task_complete(
+            assistx_task_id="ax_789",
+            status="FAILED",
+            summary="blocked: need more info",
+        )
+
+    call_body = mock_client.return_value.__enter__.return_value.post.call_args[1]["json"]
+    assert call_body["status"] == "FAILED"
+    assert call_body["summary"] == "blocked: need more info"
+
+
+@patch("tools.kanban_tools.httpx.Client")
+def test_notify_assistx_skips_when_no_base_url(mock_client):
+    from tools.kanban_tools import _notify_assistx_task_complete
+
+    with patch.dict(os.environ, clear=True):
+        _notify_assistx_task_complete(assistx_task_id="ax_999", status="DONE")
+
+    mock_client.assert_not_called()
+
+
+@patch("tools.kanban_tools.httpx.Client")
+def test_notify_assistx_skips_when_no_task_id(mock_client):
+    from tools.kanban_tools import _notify_assistx_task_complete
+
+    with patch.dict(os.environ, {"ASSISTX_BASE_URL": "http://assistx:8000"}):
+        _notify_assistx_task_complete(assistx_task_id=None, status="DONE")
+
+    mock_client.assert_not_called()
+
+
+@patch("tools.kanban_tools.httpx.Client")
+def test_notify_assistx_handles_http_error_gracefully(mock_client):
+    from tools.kanban_tools import _notify_assistx_task_complete
+
+    mock_response = __import__("unittest").mock.MagicMock()
+    mock_response.status_code = 500
+    mock_response.text = "Internal Server Error"
+
+    mock_client.return_value.__enter__.return_value.post.return_value = mock_response
+    mock_response.raise_for_status.side_effect = httpx.HTTPStatusError(
+        "500", request=__import__("unittest").mock.MagicMock(), response=mock_response
+    )
+
+    with patch.dict(os.environ, {"ASSISTX_BASE_URL": "http://assistx:8000"}):
+        # Should not raise — errors are logged, not propagated
+        _notify_assistx_task_complete(assistx_task_id="ax_err", status="DONE")
+
+    mock_client.return_value.__enter__.return_value.post.assert_called_once()

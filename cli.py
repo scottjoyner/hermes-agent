@@ -770,10 +770,12 @@ from rich.text import Text as _RichText
 
 # Import agent and tool systems lazily. Bare interactive startup only needs the
 # prompt; the full agent/tool registry is initialized on first use.
+# NOTE (W-79): route through the shared make_agent factory so CLI and gateway
+# construct AIAgent through ONE path.
 def AIAgent(*args, **kwargs):
-    from run_agent import AIAgent as _AIAgent
+    from agent.factory import make_agent
 
-    return _AIAgent(*args, **kwargs)
+    return make_agent(*args, **kwargs)
 
 
 def get_tool_definitions(*args, **kwargs):

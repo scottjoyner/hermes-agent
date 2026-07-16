@@ -1,0 +1,8 @@
+name: knowledge_graph
+description: Knowledge-graph "second brain" — captures every Hermes session, chain-of-thought, and tool call as embeddable graph nodes in Neo4j, with a dedicated ideas subgraph linking to docs/repos/file paths.
+version: "1.0.0"
+author: Hermes Agent
+license: MIT
+type: memory
+config_section: knowledge_graph
+memory_provider: true

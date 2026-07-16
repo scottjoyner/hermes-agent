@@ -70,6 +70,9 @@ _HERMES_CORE_TOOLS = [
     "kanban_unblock",
     # Computer use (macOS, gated on cua-driver being installed via check_fn)
     "computer_use",
+    # Auto-assign worker coordination (gated on AUTO_ASSIGN_BASE_URL via check_fn)
+    "auto_assign_status", "auto_assign_claim", "auto_assign_heartbeat",
+    "auto_assign_complete",
 ]
 
 # Webhook events may originate from untrusted third-party content (for example,
@@ -541,7 +544,13 @@ TOOLSETS = {
         "description": "Gateway toolset - union of all messaging platform tools",
         "tools": [],
         "includes": ["hermes-telegram", "hermes-discord", "hermes-whatsapp", "hermes-slack", "hermes-signal", "hermes-bluebubbles", "hermes-homeassistant", "hermes-email", "hermes-sms", "hermes-mattermost", "hermes-matrix", "hermes-dingtalk", "hermes-feishu", "hermes-wecom", "hermes-wecom-callback", "hermes-weixin", "hermes-qqbot", "hermes-webhook", "hermes-yuanbao"]
-    }
+    },
+
+    "auto_assign": {
+        "description": "Claim, heartbeat, and complete work assignments through the auto-assign service",
+        "tools": ["auto_assign_status", "auto_assign_claim", "auto_assign_heartbeat", "auto_assign_complete"],
+        "includes": []
+    },
 }
 
 

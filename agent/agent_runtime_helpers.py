@@ -1271,6 +1271,31 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
             agent._client_log_context(),
         )
         return client
+    if agent.provider == "opencode-cli" or str(client_kwargs.get("base_url", "")).startswith("opencode://"):
+        from agent.opencode_client import OpenCodeClient
+
+        # Scope the subprocess to the agent's working directory so the child
+        # opencode session operates on the right project.
+        _cwd = (
+            client_kwargs.get("cwd")
+            or getattr(agent, "terminal_cwd", None)
+            or getattr(agent, "cwd", None)
+            or None
+        )
+        safe_kwargs = {
+            k: v for k, v in client_kwargs.items()
+            if k in {"api_key", "base_url", "default_headers", "model", "timeout",
+                     "command", "args", "agent"}
+        }
+        safe_kwargs["cwd"] = _cwd
+        client = OpenCodeClient(**safe_kwargs)
+        _ra().logger.info(
+            "OpenCode CLI subagent client created (%s, shared=%s) %s",
+            reason,
+            shared,
+            agent._client_log_context(),
+        )
+        return client
     if agent.provider == "gemini":
         from agent.gemini_native_adapter import GeminiNativeClient, is_native_gemini_base_url
 

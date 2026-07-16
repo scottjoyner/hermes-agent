@@ -31,11 +31,59 @@ from __future__ import annotations
 import json
 import logging
 import os
+import uuid
 from typing import Any, Optional
+
+import httpx
 
 from tools.registry import registry, tool_error
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# AssistX notification helpers
+# ---------------------------------------------------------------------------
+
+
+def _assistx_base_url() -> str | None:
+    return os.getenv("ASSISTX_BASE_URL") or os.getenv("AUTO_ASSIGN_ASSISTX_BASE_URL")
+
+
+def _notify_assistx_task_complete(
+    assistx_task_id: str,
+    status: str = "DONE",
+    summary: str | None = None,
+    result: dict[str, Any] | None = None,
+) -> None:
+    """POST a completion or failure to the AssistX task API."""
+    base = _assistx_base_url()
+    if not base or not assistx_task_id:
+        return
+    url = f"{base.rstrip('/')}/api/tasks/{assistx_task_id}/complete"
+    body = {
+        "agent_id": os.getenv("HERMES_PROFILE", "hermes-agent"),
+        "status": status,
+        "summary": summary or "",
+        "idempotency_key": f"kanban-complete:{assistx_task_id}:{uuid.uuid4().hex[:8]}",
+    }
+    if result:
+        body["result"] = result
+    auth_user = os.getenv("ASSISTX_BASIC_AUTH_USER", "")
+    auth_pass = os.getenv("ASSISTX_BASIC_AUTH_PASS", "")
+    try:
+        with httpx.Client(timeout=30.0) as c:
+            auth = (auth_user, auth_pass) if auth_user else None
+            resp = c.post(url, json=body, auth=auth)
+            resp.raise_for_status()
+            logger.info("notified AssistX task %s: status=%s", assistx_task_id, status)
+    except httpx.HTTPStatusError as e:
+        code = e.response.status_code if e.response else "unknown"
+        body = e.response.text[:200] if e.response else ""
+        logger.warning("AssistX notification failed for %s (%s): %s",
+                       assistx_task_id, code, body)
+    except httpx.RequestError as e:
+        logger.warning("AssistX notification failed for %s: %s", assistx_task_id, e)
 
 
 # ---------------------------------------------------------------------------
@@ -241,6 +289,7 @@ def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
         "completed_at": task.completed_at,
         "current_run_id": task.current_run_id,
         "model_override": task.model_override,
+        "assistx_task_id": getattr(task, "assistx_task_id", None),
         "parents": parents,
         "children": children,
         "parent_count": len(parents),
@@ -286,6 +335,7 @@ def _handle_show(args: dict, **kw) -> str:
                     "result": t.result,
                     "current_run_id": t.current_run_id,
                     "model_override": t.model_override,
+                    "assistx_task_id": getattr(t, "assistx_task_id", None),
                 }
 
             def _run_dict(r):
@@ -465,6 +515,7 @@ def _handle_complete(args: dict, **kw) -> str:
             f"metadata must be an object/dict, got {type(metadata).__name__}"
         )
     metadata = _stamp_worker_session_metadata(tid, metadata)
+    assistx_task_id = args.get("assistx_task_id")
     board = args.get("board")
     try:
         kb, conn = _connect(board=board)
@@ -501,6 +552,12 @@ def _handle_complete(args: dict, **kw) -> str:
                     f"could not complete {tid} (unknown id or already terminal)"
                 )
             run = kb.latest_run(conn, tid)
+            _notify_assistx_task_complete(
+                assistx_task_id=assistx_task_id,
+                status="DONE",
+                summary=summary,
+                result={"kanban_task_id": tid} if result else None,
+            )
             return _ok(task_id=tid, run_id=run.id if run else None)
         finally:
             conn.close()
@@ -524,6 +581,7 @@ def _handle_block(args: dict, **kw) -> str:
     reason = args.get("reason")
     if not reason or not str(reason).strip():
         return tool_error("reason is required — explain what input you need")
+    assistx_task_id = args.get("assistx_task_id")
     board = args.get("board")
     try:
         kb, conn = _connect(board=board)
@@ -539,6 +597,11 @@ def _handle_block(args: dict, **kw) -> str:
                     f"running/ready)"
                 )
             run = kb.latest_run(conn, tid)
+            _notify_assistx_task_complete(
+                assistx_task_id=assistx_task_id,
+                status="FAILED",
+                summary=str(reason),
+            )
             return _ok(task_id=tid, run_id=run.id if run else None)
         finally:
             conn.close()
@@ -681,6 +744,7 @@ def _handle_create(args: dict, **kw) -> str:
         return tool_error(
             f"parents must be a list of task ids, got {type(parents).__name__}"
         )
+    assistx_task_id = args.get("assistx_task_id")
     board = args.get("board")
     try:
         kb, conn = _connect(board=board)
@@ -705,6 +769,7 @@ def _handle_create(args: dict, **kw) -> str:
                 initial_status=str(initial_status),
                 created_by=os.environ.get("HERMES_PROFILE") or "worker",
                 session_id=session_id,
+                assistx_task_id=assistx_task_id,
             )
             new_task = kb.get_task(conn, new_tid)
             return _ok(
@@ -952,6 +1017,13 @@ KANBAN_COMPLETE_SCHEMA = {
                     "are silently skipped."
                 ),
             },
+            "assistx_task_id": {
+                "type": "string",
+                "description": (
+                    "Optional AssistX canonical task ID. When set, completing "
+                    "the task will notify AssistX of the terminal state."
+                ),
+            },
             "board": _board_schema_prop(),
         },
         "required": [],
@@ -980,6 +1052,13 @@ KANBAN_BLOCK_SCHEMA = {
                     "What you need answered, in one or two sentences. "
                     "Don't paste the whole conversation; the human has "
                     "the board and can ask follow-ups via comments."
+                ),
+            },
+            "assistx_task_id": {
+                "type": "string",
+                "description": (
+                    "Optional AssistX canonical task ID. When set, blocking "
+                    "the task will notify AssistX of the blocked state."
                 ),
             },
             "board": _board_schema_prop(),
@@ -1164,6 +1243,13 @@ KANBAN_CREATE_SCHEMA = {
                     "task, ['github-code-review'] for a reviewer task. "
                     "The names must match skills installed on the "
                     "assignee's profile."
+                ),
+            },
+            "assistx_task_id": {
+                "type": "string",
+                "description": (
+                    "Optional AssistX canonical task ID. When set, the kanban "
+                    "task is linked to an AssistX task for cross-system state sync."
                 ),
             },
             "board": _board_schema_prop(),

@@ -2107,6 +2107,7 @@ class AIAgent:
         original_user_message: Any,
         final_response: Any,
         interrupted: bool,
+        turn: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Mirror a completed turn into external memory providers.
 
@@ -2147,6 +2148,15 @@ class AIAgent:
                 original_user_message,
                 session_id=self.session_id or "",
             )
+            # Rich per-turn capture (chain-of-thought, tool calls, etc.).
+            # Best-effort: never blocks the user's response.
+            if turn:
+                rich_turn = dict(turn)
+                rich_turn.setdefault("session_id", self.session_id or "")
+                rich_turn.setdefault("user_message", original_user_message)
+                rich_turn.setdefault("assistant_response", final_response)
+                rich_turn.setdefault("interrupted", interrupted)
+                self._memory_manager.record_turn_all(rich_turn)
         except Exception:
             pass
 
@@ -4101,6 +4111,8 @@ class AIAgent:
             acp_command=function_args.get("acp_command"),
             acp_args=function_args.get("acp_args"),
             role=function_args.get("role"),
+            provider=function_args.get("provider"),
+            return_format=function_args.get("return_format"),
             parent_agent=self,
         )
 

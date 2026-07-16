@@ -252,6 +252,26 @@ delegation:
 
 **Check results.** Subagent summaries are just that — summaries. If a subagent says "fixed the bug and tests pass," verify by running the tests yourself or reading the diff.
 
+### Return contract for machine-consumed results
+
+When the delegated output feeds another tool, a comparison, or programmatic
+logic (this includes `provider="opencode-cli"`, a real `opencode` CLI session
+whose answer is consumed rather than read), a prose summary is not enough —
+the parent may only receive a *description* of the result, not the result
+itself. Pin a return contract with `return_format`:
+
+- `return_format="verbatim"` — child returns ONLY the raw result value (no
+  preamble/markdown/fences). Use when the parent needs the exact token
+  (e.g. "Reply with exactly the word PONG" → parent receives `PONG`).
+- `return_format="json"` — child returns a single `{"result": ..., "ok": true}`
+  object (no surrounding prose). Best for structured results.
+- `return_format="summary"` (default) — prose recap. Fine for human-readable
+  work, but never rely on the parent LLM to extract a value from it.
+
+The contract is injected into the child's system prompt as a `RETURN CONTRACT`
+block. Best practice: **always pin `verbatim` or `json` whenever the delegated
+output is consumed by code**, not just reported to a human.
+
 ---
 
 *For the complete delegation reference — all parameters, ACP integration, and advanced configuration — see [Subagent Delegation](/user-guide/features/delegation).*

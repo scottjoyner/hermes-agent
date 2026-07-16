@@ -224,6 +224,30 @@ class MemoryProvider(ABC):
         child_session_id: the subagent's session_id
         """
 
+    def on_turn_recorded(self, turn: Dict[str, Any]) -> None:
+        """Called once per completed turn with the full turn payload.
+
+        Unlike ``sync_turn`` (which only receives cleaned user/assistant
+        strings), this hook receives the raw message graph for the turn so
+        providers can capture chain-of-thought, reasoning, and tool-call
+        provenance — not just the surface exchange.
+
+        ``turn`` is a dict with:
+          - ``session_id`` (str)
+          - ``user_message`` (str) — the cleaned user text
+          - ``assistant_response`` (str) — the final assistant text
+          - ``messages`` (list[dict]) — full message list (this turn's
+            tail includes the user message, any assistant messages with
+            ``reasoning``/``reasoning_content``, tool_call messages, and
+            tool result messages)
+          - ``interrupted`` (bool)
+          - ``platform`` (str), ``agent_context`` (str) — optional,
+            propagated from the agent when available.
+
+        Default is no-op for backward compatibility. Providers that want
+        rich capture (knowledge graph, CoT logging) override this.
+        """
+
     def get_config_schema(self) -> List[Dict[str, Any]]:
         """Return config fields this provider needs for setup.
 

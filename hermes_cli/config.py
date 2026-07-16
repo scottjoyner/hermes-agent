@@ -1287,9 +1287,72 @@ DEFAULT_CONFIG = {
         "user_char_limit": 1375,     # ~500 tokens at 2.75 chars/token
         # External memory provider plugin (empty = built-in only).
         # Set to a provider name to activate: "openviking", "mem0",
-        # "hindsight", "holographic", "retaindb", "byterover".
+        # "hindsight", "holographic", "retaindb", "byterover",
+        # "knowledge_graph".
         # Only ONE external provider is allowed at a time.
         "provider": "",
+    },
+
+    # Knowledge Graph "second brain" — captures every session, chain-of-thought,
+    # and tool call as embeddable graph nodes in Neo4j, with a dedicated
+    # "ideas" subgraph that links to docs / repos / file paths.
+    "knowledge_graph": {
+        # Activation is via memory.provider = "knowledge_graph". This flag
+        # additionally gates whether the provider reports itself available.
+        "enabled": False,
+        # Neo4j connection (blank -> env NEO4J_URI / NEO4J_USER / NEO4J_PASSWORD).
+        "uri": "",
+        "user": "",
+        "password": "",
+        "database": "",          # blank -> env NEO4J_DATABASE or "neo4j"
+        # Local embeddings (OpenAI-compatible endpoint, e.g. LM Studio).
+        "embeddings": {
+            "backend": "local",  # "local" = OpenAI-compatible /embeddings
+            "base_url": "",        # blank -> env LMSTUDIO_EMBEDDINGS_BASE_URL or http://localhost:1234/v1
+            "model": "",           # blank -> env LMSTUDIO_EMBEDDINGS_MODEL or "nomic-embed-text"
+            "api_key": "",         # optional; blank -> env LMSTUDIO_EMBEDDINGS_API_KEY
+            "dimensions": 0,      # 0 = auto-detect from first embedding
+            "batch_size": 32,
+            "timeout": 30.0,
+        },
+        "capture": {
+            "sessions": True,
+            "chain_of_thought": True,
+            "tool_calls": True,
+            "user_messages": True,
+            "assistant_messages": True,
+        },
+        "search": {
+            "top_k": 8,
+            "similarity_cutoff": 0.0,   # 0 = no threshold
+            "include_cot": True,
+            "include_docs": True,
+            # Recall re-ranks a MIX of doc + chain-of-thought hits.
+            # scope: "both" | "docs" | "cot".  When "both", doc_weight /
+            # cot_weight blend the two score streams; if omitted, default 60% doc /
+            # 40% CoT.  Pass explicit weights via kg_search to override.
+            "scope": "both",
+            "doc_weight": 0.6,
+            "cot_weight": 0.4,
+        },
+        # The KG is the agent's DOC SURFACE: markdown files are indexed with
+        # their real file paths so recall points at the source, not a summary.
+        # doc_roots are indexed on demand via kg_index_docs (recursive).
+        "doc_roots": [],                # e.g. ["/mnt/nas/docs", "~/projects/foo/README.md"]
+        "auto_index_docs": False,        # if true, kg_index_docs runs on session start
+        # Per-model harness: dumber models tend to lean on the graph instead
+        # of reading the actual .md. The harness tunes recall so each model
+        # behaves — weak models get full text + a "read the source" nudge,
+        # strong models get terse pointers and fetch docs themselves.
+        "harness": {
+            "tier": "",                # force a tier: "weak"|"standard"|"strong" (blank = auto by model)
+            "default_tier": "standard",
+            "tiers": {
+                "weak":     {"inject_full_text": True,  "read_source_nudge": True,  "prefetch_top_k": 12, "max_recall_chars": 1200},
+                "standard": {"inject_full_text": False, "read_source_nudge": False, "prefetch_top_k": 8,  "max_recall_chars": 600},
+                "strong":   {"inject_full_text": False, "read_source_nudge": False, "prefetch_top_k": 6,  "max_recall_chars": 400},
+            },
+        },
     },
 
     # Subagent delegation — override the provider:model used by delegate_task
@@ -3011,6 +3074,57 @@ OPTIONAL_ENV_VARS = {
         "url": None,
         "password": False,
         "category": "setting",
+    },
+    # ── Knowledge Graph memory provider (Neo4j + local embeddings) ──
+    "NEO4J_URI": {
+        "description": "Neo4j bolt URI for the knowledge-graph memory backend",
+        "prompt": "Neo4j URI (e.g. bolt://localhost:7687)",
+        "url": None,
+        "password": False,
+        "category": "memory",
+    },
+    "NEO4J_USER": {
+        "description": "Neo4j username",
+        "prompt": "Neo4j user",
+        "url": None,
+        "password": False,
+        "category": "memory",
+    },
+    "NEO4J_PASSWORD": {
+        "description": "Neo4j password",
+        "prompt": "Neo4j password",
+        "url": None,
+        "password": True,
+        "category": "memory",
+    },
+    "NEO4J_DATABASE": {
+        "description": "Neo4j database name (default: neo4j)",
+        "prompt": "Neo4j database",
+        "url": None,
+        "password": False,
+        "category": "memory",
+    },
+    # Local embeddings served by an OpenAI-compatible endpoint (e.g. LM Studio).
+    "LMSTUDIO_EMBEDDINGS_BASE_URL": {
+        "description": "Base URL of a local OpenAI-compatible embeddings endpoint (LM Studio / Ollama)",
+        "prompt": "Local embeddings base URL (e.g. http://localhost:1234/v1)",
+        "url": None,
+        "password": False,
+        "category": "memory",
+    },
+    "LMSTUDIO_EMBEDDINGS_MODEL": {
+        "description": "Embedding model name served by the local endpoint (e.g. nomic-embed-text)",
+        "prompt": "Embedding model name",
+        "url": None,
+        "password": False,
+        "category": "memory",
+    },
+    "LMSTUDIO_EMBEDDINGS_API_KEY": {
+        "description": "Optional API key for the local embeddings endpoint (usually blank for LM Studio)",
+        "prompt": "Local embeddings API key (optional)",
+        "url": None,
+        "password": True,
+        "category": "memory",
     },
 }
 

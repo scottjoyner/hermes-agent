@@ -565,7 +565,7 @@ class MemoryManager:
                 )
 
     def on_delegation(self, task: str, result: str, *,
-                      child_session_id: str = "", **kwargs) -> None:
+                       child_session_id: str = "", **kwargs) -> None:
         """Notify all providers that a subagent completed."""
         for provider in self._providers:
             try:
@@ -575,6 +575,21 @@ class MemoryManager:
             except Exception as e:
                 logger.debug(
                     "Memory provider '%s' on_delegation failed: %s",
+                    provider.name, e,
+                )
+
+    def record_turn_all(self, turn: Dict[str, Any]) -> None:
+        """Notify all providers of a recorded turn (rich payload, incl. CoT).
+
+        Routes to each provider's ``on_turn_recorded`` hook. Failures in
+        one provider never block the others or the user's response.
+        """
+        for provider in self._providers:
+            try:
+                provider.on_turn_recorded(turn)
+            except Exception as e:
+                logger.debug(
+                    "Memory provider '%s' on_turn_recorded failed: %s",
                     provider.name, e,
                 )
 
