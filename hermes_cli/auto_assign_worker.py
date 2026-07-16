@@ -11,31 +11,23 @@ import json
 import logging
 import os
 import time
-import uuid
 from datetime import UTC, datetime
 
-import httpx
 from hermes_cli.config import load_config
+from tools._auto_assign_client import (
+    AUTO_ASSIGN_ENV,
+    _base_url,
+    claim_assignment as _client_claim,
+    complete_assignment as _client_complete,
+    fetch_assignments,
+    send_heartbeat as _client_heartbeat,
+)
 
 logger = logging.getLogger(__name__)
 
-AUTO_ASSIGN_ENV = "AUTO_ASSIGN_BASE_URL"
 POLL_INTERVAL = int(os.getenv("HERMES_AA_POLL_INTERVAL", "30"))
 HEARTBEAT_INTERVAL = int(os.getenv("HERMES_AA_HEARTBEAT_INTERVAL", "60"))
 LEASE_SECONDS = int(os.getenv("HERMES_AA_LEASE_SECONDS", "900"))
-
-
-def _worker_id() -> str:
-    return os.getenv("HERMES_WORKER_ID", "hermes-agent")
-
-
-def _node_id() -> str:
-    import platform
-    return platform.node() or "unknown"
-
-
-def _base_url() -> str | None:
-    return os.getenv(AUTO_ASSIGN_ENV)
 
 
 # ---------------------------------------------------------------------------
@@ -70,73 +62,32 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
 
 
 def fetch_recommended_assignments(base: str, limit: int = 10) -> list[dict]:
-    with httpx.Client(base_url=base, timeout=30.0) as c:
-        resp = c.get("/api/assignments", params={"limit": limit})
-        resp.raise_for_status()
-        data = resp.json()
-        assignments = data if isinstance(data, list) else data.get("assignments", [])
+    assignments = fetch_assignments(base, limit=limit)
     return [a for a in assignments if a.get("status") == "recommended"
             and a.get("selected_lane") in ("direct_worker", "local_only")]
 
 
+# Thin wrappers kept for the CLI worker's own call sites and tests; they
+# delegate to the shared client in tools/_auto_assign_client.py (W-81).
 def claim_assignment(base: str, assignment: dict) -> dict | None:
-    assignment_id = assignment["assignment_id"]
-    task_id = assignment["task_id"]
-    correlation_id = uuid.uuid4().hex
-    body = {
-        "correlation_id": correlation_id,
-        "task_id": task_id,
-        "worker_id": _worker_id(),
-        "node_id": _node_id(),
-        "capabilities": ["terminal", "web_search", "file"],
-        "lease_seconds": LEASE_SECONDS,
-        "links": {
-            "correlation_id": correlation_id,
-            "task_id": task_id,
-            "assignment_id": assignment_id,
-        },
-    }
-    with httpx.Client(base_url=base, timeout=30.0) as c:
-        resp = c.post(f"/api/assignments/{assignment_id}/claim", json=body)
-        resp.raise_for_status()
-        return resp.json()
+    return _client_claim(
+        base,
+        assignment_id=assignment["assignment_id"],
+        task_id=assignment["task_id"],
+        lease_seconds=LEASE_SECONDS,
+    )
 
 
 def send_heartbeat(base: str, assignment_id: str, status: str = "running") -> bool:
-    correlation_id = uuid.uuid4().hex
-    body = {
-        "node_id": _node_id(),
-        "worker_id": _worker_id(),
-        "assignment_id": assignment_id,
-        "status": status,
-        "correlation_id": correlation_id,
-    }
-    with httpx.Client(base_url=base, timeout=30.0) as c:
-        resp = c.post("/api/heartbeats", json=body)
-        resp.raise_for_status()
-        return True
+    _client_heartbeat(base, assignment_id=assignment_id, status=status)
+    return True
 
 
 def complete_assignment(base: str, assignment_id: str, task_id: str,
                         status: str = "success", summary: str = "") -> bool:
-    correlation_id = uuid.uuid4().hex
-    body = {
-        "correlation_id": correlation_id,
-        "assignment_id": assignment_id,
-        "task_id": task_id,
-        "worker_id": _worker_id(),
-        "status": status,
-        "summary": summary,
-        "links": {
-            "correlation_id": correlation_id,
-            "task_id": task_id,
-            "assignment_id": assignment_id,
-        },
-    }
-    with httpx.Client(base_url=base, timeout=30.0) as c:
-        resp = c.post(f"/api/assignments/{assignment_id}/complete", json=body)
-        resp.raise_for_status()
-        return True
+    _client_complete(base, assignment_id=assignment_id, task_id=task_id,
+                     status=status, summary=summary)
+    return True
 
 
 def execute_work(assignment: dict) -> tuple[str, str]:

@@ -1,27 +1,19 @@
 """Auto-Assign integration tools for claiming, heartbeating, and completing work assignments."""
 
-import json
 import logging
-import os
-import platform
-import uuid
 from typing import Any
 
-import httpx
-
 from tools.registry import registry, tool_error, tool_result
+from tools._auto_assign_client import (
+    AUTO_ASSIGN_ENV,
+    check_requirements as check_auto_assign_requirements,
+    claim_assignment,
+    complete_assignment,
+    send_heartbeat,
+    fetch_assignments,
+)
 
 logger = logging.getLogger(__name__)
-
-AUTO_ASSIGN_ENV = "AUTO_ASSIGN_BASE_URL"
-
-
-def _base_url() -> str | None:
-    return os.getenv(AUTO_ASSIGN_ENV)
-
-
-def check_auto_assign_requirements() -> bool:
-    return bool(_base_url())
 
 
 # ---------------------------------------------------------------------------
@@ -152,132 +144,85 @@ AUTO_ASSIGN_COMPLETE_SCHEMA = {
 }
 
 # ---------------------------------------------------------------------------
-# Handlers
+# Handlers (delegate to the shared client in tools/_auto_assign_client.py)
 # ---------------------------------------------------------------------------
 
 
-def _worker_id() -> str:
-    return os.getenv("HERMES_WORKER_ID", "hermes-agent")
-
-
-def _node_id() -> str:
-    return platform.node() or os.uname().nodename
-
-
 def _handle_auto_assign_status(args: dict, **kw) -> str:
+    from tools._auto_assign_client import _base_url
+
     base = _base_url()
     if not base:
         return tool_error("AUTO_ASSIGN_BASE_URL not set")
     try:
-        with httpx.Client(base_url=base, timeout=30.0) as c:
-            resp = c.get("/api/assignments", params={"limit": args.get("limit", 10)})
-            resp.raise_for_status()
-            data = resp.json()
-            return tool_result({"assignments": data, "count": len(data)})
+        data = fetch_assignments(base, limit=args.get("limit", 10))
+        return tool_result({"assignments": data, "count": len(data)})
     except Exception as e:
         return tool_error(f"auto-assign status check failed: {e}")
 
 
 def _handle_auto_assign_claim(args: dict, **kw) -> str:
+    from tools._auto_assign_client import _base_url
+
     base = _base_url()
     if not base:
         return tool_error("AUTO_ASSIGN_BASE_URL not set")
     try:
         assignment_id = args["assignment_id"]
-        correlation_id = kw.get("correlation_id") or str(uuid.uuid4())
-        body = {
-            "correlation_id": correlation_id,
-            "task_id": args["task_id"],
-            "worker_id": _worker_id(),
-            "node_id": _node_id(),
-            "capabilities": args.get("capabilities", ["terminal", "web_search", "file"]),
-            "lease_seconds": args.get("lease_seconds", 900),
-            "links": {
-                "correlation_id": correlation_id,
-                "dispatch_id": kw.get("dispatch_id"),
-                "task_id": args["task_id"],
-                "route_id": kw.get("route_id"),
-                "assignment_id": assignment_id,
-            },
-        }
-        with httpx.Client(base_url=base, timeout=30.0) as c:
-            resp = c.post(f"/api/assignments/{assignment_id}/claim", json=body)
-            resp.raise_for_status()
-            return tool_result(resp.json())
-    except httpx.HTTPStatusError as e:
-        detail = "unknown"
-        try:
-            detail = e.response.json()
-        except Exception:
-            detail = e.response.text[:500]
-        return tool_error(f"claim failed ({e.response.status_code}): {detail}")
+        result = claim_assignment(
+            base,
+            assignment_id=assignment_id,
+            task_id=args["task_id"],
+            correlation_id=kw.get("correlation_id"),
+            capabilities=args.get("capabilities"),
+            lease_seconds=args.get("lease_seconds", 900),
+            dispatch_id=kw.get("dispatch_id"),
+            route_id=kw.get("route_id"),
+        )
+        return tool_result(result)
     except Exception as e:
         return tool_error(f"claim failed: {e}")
 
 
 def _handle_auto_assign_heartbeat(args: dict, **kw) -> str:
+    from tools._auto_assign_client import _base_url
+
     base = _base_url()
     if not base:
         return tool_error("AUTO_ASSIGN_BASE_URL not set")
     try:
         assignment_id = args["assignment_id"]
-        correlation_id = kw.get("correlation_id") or str(uuid.uuid4())
-        body = {
-            "node_id": _node_id(),
-            "worker_id": _worker_id(),
-            "assignment_id": assignment_id,
-            "status": args.get("status", "running"),
-            "correlation_id": correlation_id,
-        }
-        with httpx.Client(base_url=base, timeout=30.0) as c:
-            resp = c.post("/api/heartbeats", json=body)
-            resp.raise_for_status()
-            return tool_result(resp.json())
-    except httpx.HTTPStatusError as e:
-        detail = "unknown"
-        try:
-            detail = e.response.json()
-        except Exception:
-            detail = e.response.text[:500]
-        return tool_error(f"heartbeat failed ({e.response.status_code}): {detail}")
+        result = send_heartbeat(
+            base,
+            assignment_id=assignment_id,
+            status=args.get("status", "running"),
+            correlation_id=kw.get("correlation_id"),
+        )
+        return tool_result(result)
     except Exception as e:
         return tool_error(f"heartbeat failed: {e}")
 
 
 def _handle_auto_assign_complete(args: dict, **kw) -> str:
+    from tools._auto_assign_client import _base_url
+
     base = _base_url()
     if not base:
         return tool_error("AUTO_ASSIGN_BASE_URL not set")
     try:
         assignment_id = args["assignment_id"]
-        correlation_id = kw.get("correlation_id") or str(uuid.uuid4())
-        body = {
-            "correlation_id": correlation_id,
-            "assignment_id": assignment_id,
-            "task_id": args["task_id"],
-            "worker_id": _worker_id(),
-            "status": args.get("status", "success"),
-            "summary": args.get("summary", ""),
-            "artifacts": args.get("artifacts", []),
-            "links": {
-                "correlation_id": correlation_id,
-                "dispatch_id": kw.get("dispatch_id"),
-                "task_id": args["task_id"],
-                "route_id": kw.get("route_id"),
-                "assignment_id": assignment_id,
-            },
-        }
-        with httpx.Client(base_url=base, timeout=30.0) as c:
-            resp = c.post(f"/api/assignments/{assignment_id}/complete", json=body)
-            resp.raise_for_status()
-            return tool_result(resp.json())
-    except httpx.HTTPStatusError as e:
-        detail = "unknown"
-        try:
-            detail = e.response.json()
-        except Exception:
-            detail = e.response.text[:500]
-        return tool_error(f"complete failed ({e.response.status_code}): {detail}")
+        result = complete_assignment(
+            base,
+            assignment_id=assignment_id,
+            task_id=args["task_id"],
+            correlation_id=kw.get("correlation_id"),
+            status=args.get("status", "success"),
+            summary=args.get("summary", ""),
+            artifacts=args.get("artifacts", []),
+            dispatch_id=kw.get("dispatch_id"),
+            route_id=kw.get("route_id"),
+        )
+        return tool_result(result)
     except Exception as e:
         return tool_error(f"complete failed: {e}")
 
