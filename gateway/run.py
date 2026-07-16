@@ -3685,6 +3685,13 @@ class GatewayRunner:
             self._gateway_loop = asyncio.get_running_loop()
         except RuntimeError:
             self._gateway_loop = None
+        # W-80: log Paperclip integration status (gating only — registration
+        # lives in the hermes-paperclip-adapter repo). Never raises.
+        try:
+            from agent.paperclip_integration import report_paperclip_integration_status
+            report_paperclip_integration_status(self.config)
+        except Exception:
+            logger.debug("Paperclip integration status check failed", exc_info=True)
         logger.info("Session storage: %s", self.config.sessions_dir)
 
         # Sanity-check that systemd's TimeoutStopSec covers our drain

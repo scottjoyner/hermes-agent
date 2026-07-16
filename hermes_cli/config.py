@@ -1800,6 +1800,16 @@ DEFAULT_CONFIG = {
         # Recency window in seconds. 600 (10 min) comfortably covers a
         # multi-tool agent turn. Bridged to HERMES_MEDIA_TRUST_RECENT_SECONDS.
         "trust_recent_files_seconds": 600,
+        # Paperclip (agent-to-agent orchestration) integration gate. When true,
+        # hermes-agent treats the Paperclip adapter as registered and logs that
+        # registration is expected. When false/absent, hermes-agent logs a
+        # "transitional: Paperclip not registered" warning at startup and runs
+        # standalone. Default null = auto-detect from the adapter repo / env:
+        # enabled if HERMES_PAPERCLIP_ADAPTER_DIR exists or
+        # PAPERCLIP_INTEGRATION_ENABLED=1 is set, disabled otherwise. (LLD W-80)
+        "paperclip": {
+            "integration_enabled": None,
+        },
     },
 
     # Session storage — controls automatic cleanup of ~/.hermes/state.db.
