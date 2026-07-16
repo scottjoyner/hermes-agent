@@ -917,13 +917,29 @@ os.environ["HERMES_QUIET"] = "1"
 os.environ["HERMES_EXEC_ASK"] = "1"
 
 # Set terminal working directory for messaging platforms.
-# config.yaml terminal.cwd is the canonical source (bridged to TERMINAL_CWD
-# by the config bridge above).  When it's unset or a placeholder, default
-# to home directory.  MESSAGING_CWD is accepted as a backward-compat
-# fallback (deprecated — the warning above tells users to migrate).
+# config.yaml ``terminal.cwd`` is the canonical source (bridged to
+# TERMINAL_CWD by the config bridge above).  When it's unset or a
+# placeholder, default to the home directory.
+#
+# ``MESSAGING_CWD`` is a LEGACY env var (pre-refactor messaging workdir).
+# It is accepted ONLY as a backward-compat fallback here and MUST NOT be
+# read as primary config anywhere else.  Migration target: set
+# ``terminal.cwd`` in config.yaml (see ``warn_deprecated_cwd_env_vars``
+# for the user-facing deprecation notice).  Do NOT extend this fallback —
+# new code should read ``TERMINAL_CWD`` (the bridge) or ``terminal.cwd``.
 _configured_cwd = os.environ.get("TERMINAL_CWD", "")
 if not _configured_cwd or _configured_cwd in {".", "auto", "cwd"}:
     _fallback = os.getenv("MESSAGING_CWD") or str(Path.home())
+    if os.getenv("MESSAGING_CWD"):
+        # Legacy fallback hit — emit a one-time deprecation notice (stderr,
+        # non-fatal).  Keep this idempotent; cron restores TERMINAL_CWD in a
+        # finally-block and must not be affected.
+        print(
+            "  \033[33m⚠\033[0m MESSAGING_CWD is deprecated; set "
+            "terminal.cwd in config.yaml instead (MESSAGING_CWD still used "
+            "as a fallback for TERMINAL_CWD here).",
+            file=sys.stderr,
+        )
     os.environ["TERMINAL_CWD"] = _fallback
 
 from gateway.config import (
