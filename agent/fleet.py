@@ -85,11 +85,23 @@ class FleetRoute:
 class Fleet:
     """Discover, catalog, and route to LMStudio endpoints on the network."""
 
-    # Default tailnet DNS suffix for Hermes agents
-    DEFAULT_TAILNET = "kipnerter.ts.net"
+    # Default tailnet DNS suffix for Hermes agents. NOTE (W-82): previously
+    # hardcoded to a personal tailnet ("kipnerter.ts.net"). Now overridable via
+    # config["fleet"]["tailnet"] or HERMES_FLEET_TAILNET / HERMES_FLEET_TAILNET_DNS.
+    DEFAULT_TAILNET = os.environ.get("HERMES_FLEET_TAILNET", "kipnerter.ts.net")
 
     # Hostnames we know about (populated from config / user hints)
     KNOWN_HOSTS: list[str] = []
+
+    # Common tailnet hostnames probed when no explicit hosts are configured.
+    # NOTE (W-82): previously hardcoded to specific personal machines
+    # ("destroyer", "scotts-macbook-air", ...). Kept ONLY as a fallback seed
+    # list and fully overridable via config["fleet"]["discovery_seed_hosts"]
+    # or HERMES_FLEET_HOSTS. No behavior break — env-provided hosts take
+    # precedence and the seed list is only used when discovery_hosts is empty.
+    DEFAULT_SEED_HOSTS: list[str] = [
+        "destroyer", "scotts-macbook-air", "scottsmacbookair", "macbook-air",
+    ]
 
     # Port range to probe on each host
     PORTS = [1234, 8000, 8080, 11434, 3000]
@@ -102,6 +114,16 @@ class Fleet:
         self.discovery_hosts = list(self.config.get("discovery_hosts", self.KNOWN_HOSTS))
         self.max_latency_ms = self.config.get("max_latency_ms", 5000)
         self.health_ttl = self.config.get("health_ttl", 300)
+        # W-82: do NOT blindly forward OPENAI_API_KEY / HERMES_FLEET_API_KEY to
+        # fleet nodes. Only forward when explicitly enabled via config or env.
+        self.forward_api_keys = bool(
+            self.config.get("forward_api_keys")
+            or os.environ.get("HERMES_FLEET_FORWARD_KEYS", "").lower() in ("1", "true", "yes")
+        )
+        # W-82: seed host list (fallback only) is configurable.
+        self.seed_hosts = list(
+            self.config.get("discovery_seed_hosts", self.DEFAULT_SEED_HOSTS)
+        )
         self._discovered = False
         self._cataloged = False
 
@@ -156,17 +178,15 @@ class Fleet:
     async def _discover_tailnet_hosts(self) -> list[str]:
         """Try to discover hosts via Tailscale DNS.
 
-        Probe common Hermes agent hostnames on the tailnet.
+        Probe configured/common Hermes agent hostnames on the tailnet.
+        W-82: the seed list is configurable (self.seed_hosts) and only used
+        as a fallback when no explicit hosts are supplied.
         """
         hosts = set()
         # Add our known hosts
         hosts.update(self.discovery_hosts)
-        # Try to resolve common tailnet names
-        common_names = [
-            "x1-370", "demo-1", "deathstar-XPS-8920", "scott-optiplex-9030-aio",
-            "destroyer", "scotts-macbook-air", "scottsmacbookair", "macbook-air",
-        ]
-        for name in common_names:
+        # Try to resolve configured seed tailnet names
+        for name in self.seed_hosts:
             fqdn = f"{name}.{self.tailnet}"
             hosts.add(fqdn)
             hosts.add(name)  # also try bare hostname
@@ -384,10 +404,13 @@ class Fleet:
                 "Content-Type": "application/json",
                 "Accept": "application/json",
             }
-            # Forward API key if configured
-            api_key = os.environ.get("HERMES_FLEET_API_KEY") or os.environ.get("OPENAI_API_KEY")
-            if api_key:
-                headers["Authorization"] = f"Bearer {api_key}"
+            # W-82: only forward API key when explicitly enabled.
+            if self.forward_api_keys:
+                api_key = os.environ.get("HERMES_FLEET_API_KEY") or os.environ.get("OPENAI_API_KEY")
+                if api_key:
+                    headers["Authorization"] = f"Bearer {api_key}"
+            elif os.environ.get("HERMES_FLEET_API_KEY") or os.environ.get("OPENAI_API_KEY"):
+                logger.debug("Not forwarding API key to fleet node (forward_api_keys disabled)")
 
             data = json.dumps(payload).encode("utf-8")
             req = urllib.request.Request(url, data=data, headers=headers, method="POST")
@@ -434,9 +457,11 @@ class Fleet:
                 "Content-Type": "application/json",
                 "Accept": "application/json",
             }
-            api_key = os.environ.get("HERMES_FLEET_API_KEY") or os.environ.get("OPENAI_API_KEY")
-            if api_key:
-                headers["Authorization"] = f"Bearer {api_key}"
+            # W-82: only forward API key when explicitly enabled.
+            if self.forward_api_keys:
+                api_key = os.environ.get("HERMES_FLEET_API_KEY") or os.environ.get("OPENAI_API_KEY")
+                if api_key:
+                    headers["Authorization"] = f"Bearer {api_key}"
 
             data = json.dumps(payload).encode("utf-8")
             req = urllib.request.Request(url, data=data, headers=headers, method="POST")
