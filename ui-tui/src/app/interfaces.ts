@@ -255,6 +255,7 @@ export interface GatewayEventHandlerContext {
     setHistoryItems: StateSetter<Msg[]>
   }
   voice: {
+    getVoiceTts: () => boolean
     setProcessing: StateSetter<boolean>
     setRecording: StateSetter<boolean>
     setVoiceEnabled: StateSetter<boolean>

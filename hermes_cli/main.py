@@ -1632,7 +1632,7 @@ def _pin_kanban_board_env() -> None:
 
 
 def cmd_voice(args):
-    """Launch Hermes in voice-first TUI mode."""
+    """Launch Hermes in full voice-to-voice mode."""
     _require_tty("voice")
     _set_chat_arg_defaults(args)
     args.command = "chat"
@@ -1667,11 +1667,14 @@ def _print_voice_launcher_status():
     print()
     print("Voice launcher status")
     print("  Entry:      hermes voice")
+    print("  Mode:       voice-to-voice")
+    print("  Speech out: enabled by default; /voice tts toggles it")
     print("  Text-only:  hermes voice off")
     print("  In-session:  /voice on | /voice off | /voice tts | /voice status")
-    print(f"  Record key: {record_key}")
+    print("  Listen:     always-on VAD; speak a prompt and pause to send")
+    print(f"  Record key: {record_key} stops/restarts listening")
+    print(f"  STT ready:  {'yes' if voice_reqs['available'] else 'no'}")
     print(f"  TTS ready:  {'yes' if tts_ready else 'no'}")
-    print(f"  Voice ready: {'yes' if voice_reqs['available'] else 'no'}")
     for line in voice_reqs["details"].split("\n"):
         print(f"    {line}")
 
@@ -11134,10 +11137,11 @@ def main():
     # =========================================================================
     voice_parser = subparsers.add_parser(
         "voice",
-        help="Launch Hermes in voice-first mode (or inspect with status/off)",
+        help="Launch Hermes in voice-to-voice mode (or inspect with status/off)",
         description=(
-            "Start the interactive TUI with voice mode and spoken replies enabled. "
-            "Use 'status' for a readiness report or 'off' for text-first mode."
+            "Start the interactive TUI with always-listening voice input and spoken replies enabled. "
+            "Use 'status' for a readiness report or 'off' for text-first mode. "
+            "Use /voice tts in-session to toggle spoken replies."
         ),
     )
     voice_subparsers = voice_parser.add_subparsers(dest="voice_command")

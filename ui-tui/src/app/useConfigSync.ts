@@ -6,7 +6,8 @@ import type { GatewayClient } from '../gatewayClient.js'
 import type {
   ConfigFullResponse,
   ConfigMtimeResponse,
-  ReloadMcpResponse
+  ReloadMcpResponse,
+  VoiceRecordResponse
 } from '../gatewayTypes.js'
 import {
   DEFAULT_VOICE_RECORD_KEY,
@@ -224,10 +225,12 @@ export function useConfigSync({
   gw,
   setBellOnComplete,
   setVoiceEnabled,
+  setVoiceTts,
   setVoiceRecordKey,
   sid
 }: UseConfigSyncOptions) {
   const mtimeRef = useRef(0)
+  const voiceAutoStartedSidRef = useRef<null | string>(null)
 
   useEffect(() => {
     if (!sid) {
@@ -238,12 +241,35 @@ export function useConfigSync({
     // can run long enough to delay prompt.submit on the single stdio RPC pipe.
     // Environment flags are enough to initialize the UI bit; the heavier status
     // check still runs when the user opens /voice.
-    setVoiceEnabled(process.env.HERMES_VOICE === '1')
+    const voiceLauncherEnabled = process.env.HERMES_VOICE === '1'
+    const voiceLauncherTts = process.env.HERMES_VOICE_TTS === '1'
+    setVoiceEnabled(voiceLauncherEnabled)
+    setVoiceTts(voiceLauncherTts)
+
+    // ``hermes voice`` should feel like an audio mode, not a hidden
+    // push-to-talk shortcut: once the session exists, arm the VAD loop and
+    // keep listening. Each detected utterance is transcribed by the gateway and
+    // delivered as a normal prompt.submit via the voice.transcript event path.
+    if (voiceLauncherEnabled && voiceAutoStartedSidRef.current !== sid) {
+      voiceAutoStartedSidRef.current = sid
+      quietRpc<VoiceRecordResponse>(gw, 'voice.record', {
+        action: 'start',
+        auto_restart: true,
+        session_id: sid
+      }).then(r => {
+        if (r?.status === 'busy') {
+          turnController.pushActivity('voice: still transcribing; listening will resume shortly', 'info')
+        } else if (!r) {
+          turnController.pushActivity('voice: failed to auto-start microphone; run /voice status', 'error')
+        }
+      })
+    }
+
     quietRpc<ConfigMtimeResponse>(gw, 'config.get', { key: 'mtime' }).then(r => {
       mtimeRef.current = Number(r?.mtime ?? 0)
     })
     void hydrateFullConfig(gw, setBellOnComplete, setVoiceRecordKey)
-  }, [gw, setBellOnComplete, setVoiceEnabled, setVoiceRecordKey, sid])
+  }, [gw, setBellOnComplete, setVoiceEnabled, setVoiceRecordKey, setVoiceTts, sid])
 
   useEffect(() => {
     if (!sid) {
@@ -283,6 +309,7 @@ export interface UseConfigSyncOptions {
   gw: GatewayClient
   setBellOnComplete: (v: boolean) => void
   setVoiceEnabled: (v: boolean) => void
+  setVoiceTts: (v: boolean) => void
   setVoiceRecordKey?: (v: ParsedVoiceRecordKey) => void
   sid: null | string
 }

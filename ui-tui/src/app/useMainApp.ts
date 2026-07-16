@@ -427,7 +427,7 @@ export function useMainApp(gw: GatewayClient) {
     }
   }, [ui.busy])
 
-  useConfigSync({ gw, setBellOnComplete, setVoiceEnabled, setVoiceRecordKey, sid: ui.sid })
+  useConfigSync({ gw, setBellOnComplete, setVoiceEnabled, setVoiceRecordKey, setVoiceTts, sid: ui.sid })
 
   // Tab title: `⚠` waiting on approval/sudo/secret/clarify, `⏳` busy, `✓` idle.
   const model = ui.info?.model?.replace(/^.*\//, '') ?? ''
@@ -609,6 +609,7 @@ export function useMainApp(gw: GatewayClient) {
         system: { bellOnComplete, stdout, sys },
         transcript: { appendMessage, panel, setHistoryItems },
         voice: {
+          getVoiceTts: () => voiceTts,
           setProcessing: setVoiceProcessing,
           setRecording: setVoiceRecording,
           setVoiceEnabled,
@@ -628,6 +629,7 @@ export function useMainApp(gw: GatewayClient) {
       setVoiceEnabled,
       setVoiceProcessing,
       setVoiceRecording,
+      voiceTts,
       stdout,
       submitRef,
       sys
@@ -690,7 +692,7 @@ export function useMainApp(gw: GatewayClient) {
         },
         slashFlightRef,
         transcript: { page, panel, send, setHistoryItems, sys, trimLastExchange: session.trimLastExchange },
-        voice: { setVoiceEnabled, setVoiceRecordKey }
+        voice: { setVoiceEnabled, setVoiceRecordKey, setVoiceTts }
       }),
     [
       catalog,

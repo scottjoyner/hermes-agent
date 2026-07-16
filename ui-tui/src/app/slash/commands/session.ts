@@ -8,6 +8,7 @@ import type {
   SessionBranchResponse,
   SessionCompressResponse,
   SessionUsageResponse,
+  VoiceRecordResponse,
   VoiceToggleResponse
 } from '../../../gatewayTypes.js'
 import { formatVoiceRecordKey, parseVoiceRecordKey } from '../../../lib/platform.js'
@@ -292,13 +293,24 @@ export const sessionCommands: SlashCommand[] = [
             return
           }
 
-          // on/off — mirror cli.py:_enable_voice_mode's 3-line output
+          // on/off — voice-on now arms continuous VAD listening immediately;
+          // the record key remains an escape hatch to stop/restart the mic.
           if (r.enabled) {
             const tts = r.tts ? ' (TTS enabled)' : ''
             ctx.transcript.sys(`Voice mode enabled${tts}`)
-            ctx.transcript.sys(`  ${recordKeyLabel} to start/stop recording`)
+            ctx.transcript.sys('  Listening now; speak a prompt and pause to send it')
+            ctx.transcript.sys(`  ${recordKeyLabel} to stop/restart listening`)
             ctx.transcript.sys('  /voice tts  to toggle speech output')
             ctx.transcript.sys('  /voice off  to disable voice mode')
+            ctx.gateway.rpc<VoiceRecordResponse>('voice.record', {
+              action: 'start',
+              auto_restart: true,
+              session_id: ctx.sid
+            }).then(ctx.guarded<VoiceRecordResponse>(record => {
+              if (record.status === 'busy') {
+                ctx.transcript.sys('voice: still transcribing; listening will resume shortly')
+              }
+            }))
           } else {
             ctx.transcript.sys('Voice mode disabled.')
           }

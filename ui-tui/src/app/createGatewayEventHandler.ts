@@ -81,7 +81,12 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
   const { appendMessage, panel, setHistoryItems } = ctx.transcript
   const { setInput } = ctx.composer
   const { submitRef } = ctx.submission
-  const { setProcessing: setVoiceProcessing, setRecording: setVoiceRecording, setVoiceEnabled } = ctx.voice
+  const {
+    getVoiceTts,
+    setProcessing: setVoiceProcessing,
+    setRecording: setVoiceRecording,
+    setVoiceEnabled
+  } = ctx.voice
 
   let pendingThinkingStatus = ''
   let thinkingStatusTimer: null | ReturnType<typeof setTimeout> = null
@@ -713,6 +718,12 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
         if (!wasInterrupted) {
           const msgs: Msg[] = finalMessages.length ? finalMessages : [{ role: 'assistant', text: finalText }]
           msgs.forEach(appendMessage)
+
+          if (finalText && getVoiceTts()) {
+            rpc('voice.tts', { text: finalText }).catch((e: Error) => {
+              turnController.pushActivity(`voice TTS failed: ${e.message}`, 'error')
+            })
+          }
 
           if (bellOnComplete && stdout?.isTTY) {
             stdout.write('\x07')

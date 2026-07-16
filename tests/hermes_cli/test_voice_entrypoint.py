@@ -19,6 +19,38 @@ def test_voice_status_subcommand_dispatches(monkeypatch):
     assert captured == {"command": "voice", "voice_command": "status"}
 
 
+def test_voice_launcher_enables_voice_to_voice(monkeypatch):
+    import hermes_cli.main as main_mod
+
+    captured = {}
+
+    def fake_prepare_agent_startup(args):
+        captured["prepared"] = True
+
+    def fake_cmd_chat(args):
+        captured["command"] = args.command
+        captured["tui"] = args.tui
+        captured["env"] = (
+            os.environ.get("HERMES_TUI"),
+            os.environ.get("HERMES_VOICE"),
+            os.environ.get("HERMES_VOICE_TTS"),
+        )
+
+    monkeypatch.setattr(main_mod, "_prepare_agent_startup", fake_prepare_agent_startup)
+    monkeypatch.setattr(main_mod, "cmd_chat", fake_cmd_chat)
+    monkeypatch.setattr(sys, "argv", ["hermes", "voice"])
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+
+    main_mod.main()
+
+    assert captured == {
+        "prepared": True,
+        "command": "chat",
+        "tui": True,
+        "env": ("1", "1", "1"),
+        }
+
+
 def test_voice_off_subcommand_routes_to_chat_and_clears_voice_env(monkeypatch):
     import hermes_cli.main as main_mod
 

@@ -5918,11 +5918,12 @@ def _(rid, params: dict) -> dict:
 def _(rid, params: dict) -> dict:
     """VAD-bounded push-to-talk capture, CLI-parity.
 
-    ``start`` begins one VAD-bounded capture and emits ``voice.transcript``
-    after silence stops the recorder. ``stop`` forces transcription of the
-    active buffer, matching classic CLI push-to-talk. The voice wrapper retains
-    no-speech counts across single-shot starts, so three consecutive silent
-    captures emit ``voice.transcript`` with ``no_speech_limit=True``.
+    ``start`` begins VAD-bounded capture and emits ``voice.transcript`` after
+    silence stops the recorder. Pass ``auto_restart=true`` for the intuitive
+    voice-first loop used by ``hermes voice`` and ``/voice on``: after each
+    detected utterance is transcribed/submitted, the mic re-arms itself and
+    keeps listening for the next turn. Omit it for the classic record-key
+    single-shot behavior. ``stop`` forces transcription of the active buffer.
     """
     action = params.get("action", "start")
 
@@ -5961,6 +5962,7 @@ def _(rid, params: dict) -> dict:
                 if isinstance(duration, (int, float)) and not isinstance(duration, bool)
                 else 3.0
             )
+            auto_restart = bool(params.get("auto_restart"))
             started = start_continuous(
                 on_transcript=lambda t: _voice_emit("voice.transcript", {"text": t}),
                 on_status=lambda s: _voice_emit("voice.status", {"state": s}),
@@ -5969,7 +5971,7 @@ def _(rid, params: dict) -> dict:
                 ),
                 silence_threshold=safe_threshold,
                 silence_duration=safe_duration,
-                auto_restart=False,
+                auto_restart=auto_restart,
             )
             if started is False:
                 return _ok(rid, {"status": "busy"})
