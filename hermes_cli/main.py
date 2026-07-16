@@ -14,6 +14,9 @@ Usage:
     hermes setup               # Interactive setup wizard
     hermes logout              # Clear stored authentication
     hermes status              # Show status of all components
+    hermes voice               # Voice-first interactive chat
+    hermes voice status        # Show voice launcher readiness
+    hermes voice off           # Text-first launch path
     hermes cron                # Manage cron jobs
     hermes cron list           # List cron jobs
     hermes cron status         # Check if cron scheduler is running
@@ -1626,6 +1629,66 @@ def _pin_kanban_board_env() -> None:
         os.environ["HERMES_KANBAN_BOARD"] = get_current_board()
     except Exception:
         pass
+
+
+def cmd_voice(args):
+    """Launch Hermes in voice-first TUI mode."""
+    _require_tty("voice")
+    _set_chat_arg_defaults(args)
+    args.command = "chat"
+    args.tui = True
+    os.environ["HERMES_TUI"] = "1"
+    os.environ["HERMES_VOICE"] = "1"
+    os.environ["HERMES_VOICE_TTS"] = "1"
+    _prepare_agent_startup(args)
+    cmd_chat(args)
+
+
+def _clear_voice_launcher_env():
+    for key in ("HERMES_TUI", "HERMES_VOICE", "HERMES_VOICE_TTS"):
+        os.environ.pop(key, None)
+
+
+def _print_voice_launcher_status():
+    from hermes_cli.config import load_config
+    from hermes_cli.voice import (
+        format_voice_record_key_for_status,
+        voice_record_key_from_config,
+    )
+
+    from tools.tts_tool import check_tts_requirements
+    from tools.voice_mode import check_voice_requirements
+
+    cfg = load_config()
+    voice_reqs = check_voice_requirements()
+    tts_ready = check_tts_requirements()
+    record_key = format_voice_record_key_for_status(voice_record_key_from_config(cfg))
+
+    print()
+    print("Voice launcher status")
+    print("  Entry:      hermes voice")
+    print("  Text-only:  hermes voice off")
+    print("  In-session:  /voice on | /voice off | /voice tts | /voice status")
+    print(f"  Record key: {record_key}")
+    print(f"  TTS ready:  {'yes' if tts_ready else 'no'}")
+    print(f"  Voice ready: {'yes' if voice_reqs['available'] else 'no'}")
+    for line in voice_reqs["details"].split("\n"):
+        print(f"    {line}")
+
+
+def cmd_voice_off(args):
+    """Launch Hermes in text-first mode via the voice entrypoint."""
+    _set_chat_arg_defaults(args)
+    args.command = "chat"
+    args.tui = False
+    _clear_voice_launcher_env()
+    _prepare_agent_startup(args)
+    cmd_chat(args)
+
+
+def cmd_voice_status(args):
+    """Show voice launcher readiness without starting a session."""
+    _print_voice_launcher_status()
 
 
 def cmd_chat(args):
@@ -10771,7 +10834,7 @@ _BUILTIN_SUBCOMMANDS = frozenset(
         "model", "pairing", "plugins", "portal", "postinstall", "profile", "proxy",
         "send", "sessions", "setup",
         "skills", "slack", "status", "tools", "uninstall", "update",
-        "version", "webhook", "whatsapp", "chat", "secrets", "security",
+        "version", "voice", "webhook", "whatsapp", "chat", "secrets", "security",
         # Help-ish invocations — plugin commands not being listed in
         # top-level --help is an acceptable trade-off for skipping an
         # expensive eager import of every bundled plugin module.
@@ -10861,7 +10924,7 @@ def _plugin_cli_discovery_needed() -> bool:
     return True
 
 
-_AGENT_COMMANDS = {None, "chat", "acp", "rl"}
+_AGENT_COMMANDS = {None, "chat", "voice", "acp", "rl"}
 _AGENT_SUBCOMMANDS = {
     "cron": ("cron_command", {"run", "tick"}),
     "gateway": ("gateway_command", {"run"}),
@@ -11065,6 +11128,32 @@ def main():
 
     parser, subparsers, chat_parser = build_top_level_parser()
     chat_parser.set_defaults(func=cmd_chat)
+
+    # =========================================================================
+    # voice command
+    # =========================================================================
+    voice_parser = subparsers.add_parser(
+        "voice",
+        help="Launch Hermes in voice-first mode (or inspect with status/off)",
+        description=(
+            "Start the interactive TUI with voice mode and spoken replies enabled. "
+            "Use 'status' for a readiness report or 'off' for text-first mode."
+        ),
+    )
+    voice_subparsers = voice_parser.add_subparsers(dest="voice_command")
+    voice_off_parser = voice_subparsers.add_parser(
+        "off",
+        help="Launch Hermes without voice enabled",
+        description="Start Hermes in text-first mode from the voice entrypoint",
+    )
+    voice_off_parser.set_defaults(func=cmd_voice_off)
+    voice_status_parser = voice_subparsers.add_parser(
+        "status",
+        help="Show voice launcher readiness",
+        description="Show voice launcher readiness without starting a session",
+    )
+    voice_status_parser.set_defaults(func=cmd_voice_status)
+    voice_parser.set_defaults(func=cmd_voice)
 
     # =========================================================================
     # model command

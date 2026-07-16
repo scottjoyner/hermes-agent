@@ -1,17 +1,36 @@
-"""Light-mode color remapping helpers (extracted from cli.py — LLD W-78).
+"""ANSI color helpers plus light-mode remapping hooks.
 
-These functions remap dark-mode-tuned skin colors to higher-contrast
-equivalents when the terminal is detected as light mode. They were pulled out
-of the ~15k-LOC ``cli.py`` to continue its phased decomposition into
-``hermes_cli/`` submodules. ``cli.py`` re-imports them so call sites and
-behavior are unchanged.
-
-``_detect_light_mode`` and ``_LIGHT_MODE_REMAP`` remain defined in ``cli.py``
-(the former is broadly used there and the latter is the raw remap table); this
-module imports them lazily to avoid a circular import.
+This module intentionally stays tiny and import-safe because many Hermes CLI
+modules import it during startup.  It provides the legacy ``Colors`` namespace
+and ``color()`` helper expected throughout the codebase, while also installing
+an optional skin light-mode remap hook.
 """
 
 from __future__ import annotations
+
+
+class Colors:
+    """Legacy ANSI color namespace used by the Hermes CLI."""
+
+    RESET = "\033[0m"
+    BOLD = "\033[1m"
+    DIM = "\033[2m"
+    ITALIC = "\033[3m"
+    UNDERLINE = "\033[4m"
+    RED = "\033[31m"
+    GREEN = "\033[32m"
+    YELLOW = "\033[33m"
+    BLUE = "\033[34m"
+    MAGENTA = "\033[35m"
+    CYAN = "\033[36m"
+    WHITE = "\033[37m"
+
+
+def color(text: str, code: str = "") -> str:
+    """Wrap text in ANSI color codes when a code is supplied."""
+    if not code:
+        return text
+    return f"{code}{text}{Colors.RESET}"
 
 
 def _maybe_remap_for_light_mode(hex_color: str) -> str:
@@ -23,7 +42,6 @@ def _maybe_remap_for_light_mode(hex_color: str) -> str:
         return hex_color
     if not hex_color or not hex_color.startswith("#"):
         return hex_color
-    # Case-insensitive lookup (build the uppercased table lazily)
     upper = hex_color.upper()
     remap_upper = {k.upper(): v for k, v in _LIGHT_MODE_REMAP.items()}
     if upper in remap_upper:
@@ -32,8 +50,8 @@ def _maybe_remap_for_light_mode(hex_color: str) -> str:
 
 
 def _install_skin_light_mode_hook() -> None:
-    """Wrap SkinConfig.get_color at import time so EVERY skin color read goes
-    through the light-mode remap.  Idempotent."""
+    """Wrap SkinConfig.get_color at import time so every skin color read goes
+    through the light-mode remap. Idempotent."""
     try:
         from hermes_cli.skin_engine import SkinConfig  # type: ignore[import]
     except Exception:
@@ -51,3 +69,6 @@ def _install_skin_light_mode_hook() -> None:
 
     SkinConfig.get_color = _wrapped_get_color  # type: ignore[method-assign]
     SkinConfig._hermes_light_mode_hook_installed = True  # type: ignore[attr-defined]
+
+
+_install_skin_light_mode_hook()
