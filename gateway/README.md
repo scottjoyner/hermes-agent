@@ -27,7 +27,7 @@ split in one pass, so extraction is **phased**:
 |-----------|----------------|--------|
 | `gateway/status.py` | Status-message helpers (`_prepare_gateway_status_message`, `_send_or_update_status_coro`) | ✅ extracted (W-77) |
 | `gateway/lifecycle.py` | Module-level lifecycle helpers (`_gateway_loop_exception_handler`, `_ensure_ssl_certs`, `_reload_runtime_env_preserving_config_authority`, `_start_cron_ticker`) | ✅ extracted (W-77) |
-| `gateway/dispatch.py` | message routing + command dispatch | TODO |
+| `gateway/dispatch.py` | Event/media preprocessing helpers (`_build_media_placeholder`, `_format_duration`, `_probe_audio_duration`, `_dequeue_pending_event`, `_is_control_interrupt_message`) | ✅ extracted (W-77) |
 | `gateway/session.py` | session store / agent cache | exists (separate file) |
 
 Each extracted submodule re-imports into `run.py` so existing call sites and
