@@ -21,21 +21,22 @@ entry points you'll actually edit.
 
 ```
 hermes-agent/
-├── run_agent.py          # AIAgent class — core conversation loop (~4.4k LOC)
+├── run_agent.py          # AIAgent class — core conversation loop (~4.4k LOC, ~190 KB)
 ├── model_tools.py        # Tool orchestration, discover_builtin_tools(), handle_function_call()
 ├── toolsets.py           # Toolset definitions, _HERMES_CORE_TOOLS list
-├── cli.py                # HermesCLI class — interactive CLI orchestrator (~15k LOC)
+├── cli.py                # HermesCLI class — interactive CLI orchestrator (~14.6k LOC, ~651 KB)
 ├── hermes_state.py       # SessionDB — SQLite session store (FTS5 search)
 ├── hermes_constants.py   # get_hermes_home(), display_hermes_home() — profile-aware paths
 ├── hermes_logging.py     # setup_logging() — agent.log / errors.log / gateway.log (profile-aware)
 ├── batch_runner.py       # Parallel batch processing
+├── tools/terminal_tool.py # Terminal/exec backend — cwd resolution via TERMINAL_CWD (~2.4k LOC)
 ├── agent/                # Agent internals (provider adapters, memory, caching, compression, etc.)
-├── hermes_cli/           # CLI subcommands, setup wizard, plugins loader, skin engine (main.py ~14k LOC)
+├── hermes_cli/           # CLI subcommands, setup wizard, plugins loader, skin engine (main.py ~14k LOC, ~529 KB)
 ├── agent/factory.py      # make_agent(config, platform, **overrides) — single AIAgent construction path (W-79)
 ├── config/loader.py      # Unified config facade + cli-config example drift gate (W-84)
 ├── tools/                # Tool implementations — auto-discovered via tools/registry.py
 │   └── environments/     # Terminal backends (local, docker, ssh, modal, daytona, singularity)
-├── gateway/              # Messaging gateway — run.py (~18.5k LOC) + session.py + platforms/
+├── gateway/              # Messaging gateway — run.py (~18.3k LOC, ~842 KB) + session.py + platforms/
 │   ├── platforms/        # Adapter per platform (telegram, discord, slack, whatsapp,
 │   │                     #   homeassistant, signal, matrix, mattermost, email, sms,
 │   │                     #   dingtalk, wecom, weixin, feishu, qqbot, bluebubbles,
@@ -1196,3 +1197,34 @@ not the specific names.
 
 Reviewers should reject new change-detector tests; authors should convert
 them into invariants before re-requesting review.
+
+---
+
+## Docs-vs-Tree Lint (LLD W-85)
+
+The module sizes and the project-structure tree above drift as files are
+extracted (e.g. `gateway/run.py` → `gateway/{status,lifecycle,dispatch}.py`,
+`cli.py` → `hermes_cli/{colors,git_worktree}.py`). A `docs/tree-lint` CI step
+keeps AGENTS.md honest:
+
+- `scripts/check_tree_docs.py` keeps this file in sync with the real tree.
+  It detects two kinds of drift: (1) **listed-but-missing** — AGENTS.md
+  references a module path (`run_agent.py`, `cli.py`, `gateway/run.py`,
+  `hermes_cli/main.py`, etc.) that no longer exists on disk; and
+  (2) **present-but-unlisted** — a real module above a size threshold
+  (default 2000 LOC) that is not mentioned in AGENTS.md. It is non-blocking
+  (exit 0 with diagnostics) by default so it can run in pre-commit / a
+  nightly job without gating merges. Pass `--strict` (or set
+  `CHECK_TREE_DOCS_STRICT=1`) to make drift a hard failure (exit 1) once the
+  tree stabilizes. The repo's CI wires it as a **separate, non-gating job**.
+
+Run it manually:
+
+```bash
+python3 scripts/check_tree_docs.py
+python3 scripts/check_tree_docs.py --strict   # hard-fail mode
+```
+
+When you extract a large module, update the relevant size annotations above
+and re-run the script. Treat the filesystem as the source of truth — this file
+is a map, not the territory.
