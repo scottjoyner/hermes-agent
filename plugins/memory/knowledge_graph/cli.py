@@ -340,16 +340,17 @@ def knowledge_graph_command(args: argparse.Namespace) -> None:
             p._session_id = "cli"
             p._embed = embed
             p._store = store  # share the live connection
-            p._enqueue_job = lambda sid, job: p._apply_job(job)  # type: ignore[method-assign]
-            # Apply synchronously against the live store.
-            orig_apply = p._apply_job
+            # Collect jobs, then apply them synchronously against the shared
+            # live store. This makes CLI completion a durable-write boundary.
+            jobs = []
+            p._enqueue_job = lambda sid, job: jobs.append(job)  # type: ignore[method-assign]
             for path in args.paths:
                 out = p._dispatch("kg_index_docs", {
                     "paths": [path], "recursive": args.recursive, "glob": args.glob,
                 })
-                # kg_index_docs only enqueues; flush its job right away.
-                # Pull the last enqueued job is awkward — instead apply directly:
-                # re-run with the worker pointed at the store.
+                for job in jobs:
+                    p._apply_job(job)
+                jobs.clear()
                 print(f"  {path}: {out}")
             return
 
