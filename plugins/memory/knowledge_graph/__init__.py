@@ -475,6 +475,7 @@ class KnowledgeGraphMemoryProvider(MemoryProvider):
             api_key=emb.get("api_key") or "",
             timeout=float(emb.get("timeout") or 30.0),
             batch_size=int(emb.get("batch_size") or 32),
+            registry_path=emb.get("registry_path") or "",
         )
 
         # Graph store.

@@ -13,10 +13,13 @@ Embeddings are cached by content hash so repeated capture of the same text
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
+import os
 import threading
 import time
-from typing import Dict, List, Optional
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -34,33 +37,70 @@ class LocalEmbeddingClient:
         api_key: str = "",
         timeout: float = 30.0,
         batch_size: int = 32,
+        registry_path: str = "",
     ) -> None:
-        import os
-
         self.base_url = (base_url or os.environ.get("LMSTUDIO_EMBEDDINGS_BASE_URL") or _DEFAULT_BASE_URL).rstrip("/")
         self.model = model or os.environ.get("LMSTUDIO_EMBEDDINGS_MODEL") or _DEFAULT_MODEL
         self.api_key = api_key or os.environ.get("LMSTUDIO_EMBEDDINGS_API_KEY") or ""
+        self.registry_path = registry_path or os.environ.get("EMBEDDING_REGISTRY") or ""
         self.timeout = timeout
         self.batch_size = max(1, int(batch_size))
         self._dimension: Optional[int] = None
         self._cache: Dict[str, List[float]] = {}
         self._cache_lock = threading.Lock()
-        self._client = None  # lazy
+        self._clients: Dict[str, Any] = {}
+        self._active_base_url = self.base_url
 
     # -- client ---------------------------------------------------------------
 
-    def _get_client(self):
-        if self._client is None:
+    @staticmethod
+    def _normalize_base_url(url: str) -> str:
+        value = (url or "").rstrip("/")
+        if value.endswith("/embeddings"):
+            value = value[: -len("/embeddings")]
+        return value
+
+    def _candidate_base_urls(self) -> List[str]:
+        urls = [self._active_base_url, self.base_url]
+        if self.registry_path:
+            try:
+                data = json.loads(Path(self.registry_path).read_text(encoding="utf-8"))
+                endpoints = sorted(data.get("endpoints") or [], key=lambda item: item.get("priority", 9999))
+                urls.extend(str(item.get("url") or "") for item in endpoints)
+            except Exception as exc:
+                logger.warning("Embedding registry unavailable (%s): %s", self.registry_path, exc)
+        normalized: List[str] = []
+        for url in urls:
+            candidate = self._normalize_base_url(url)
+            if candidate and candidate not in normalized:
+                normalized.append(candidate)
+        return normalized
+
+    def _get_client(self, base_url: str):
+        client = self._clients.get(base_url)
+        if client is None:
             from openai import OpenAI
 
-            kwargs = {"base_url": self.base_url, "timeout": self.timeout}
+            kwargs = {"base_url": base_url, "timeout": self.timeout}
             if self.api_key:
                 kwargs["api_key"] = self.api_key
             else:
                 # LM Studio / local endpoints typically need a non-empty key.
                 kwargs["api_key"] = "not-needed"
-            self._client = OpenAI(**kwargs)
-        return self._client
+            client = OpenAI(**kwargs)
+            self._clients[base_url] = client
+        return client
+
+    def _create_embeddings(self, inputs):
+        errors = []
+        for base_url in self._candidate_base_urls():
+            try:
+                response = self._get_client(base_url).embeddings.create(model=self.model, input=inputs)
+                self._active_base_url = base_url
+                return response
+            except Exception as exc:
+                errors.append(f"{base_url}: {exc}")
+        raise RuntimeError("all embedding endpoints failed: " + "; ".join(errors))
 
     # -- helpers --------------------------------------------------------------
 
@@ -82,8 +122,7 @@ class LocalEmbeddingClient:
         if cached is not None:
             return cached
         try:
-            client = self._get_client()
-            resp = client.embeddings.create(model=self.model, input=text)
+            resp = self._create_embeddings(text)
             vec = list(resp.data[0].embedding)
         except Exception as exc:
             logger.warning("Local embedding failed for %d-char text: %s", len(text), exc)
@@ -118,12 +157,6 @@ class LocalEmbeddingClient:
         if not to_embed:
             return results
 
-        try:
-            client = self._get_client()
-        except Exception as exc:
-            logger.warning("Local embedding client unavailable: %s", exc)
-            return results
-
         for start in range(0, len(to_embed), self.batch_size):
             batch_idx = to_embed[start : start + self.batch_size]
             batch_texts = [(texts[i] or "").strip() for i in batch_idx]
@@ -131,7 +164,7 @@ class LocalEmbeddingClient:
             # unloading the model mid-queue) with a short backoff.
             for attempt in range(3):
                 try:
-                    resp = client.embeddings.create(model=self.model, input=batch_texts)
+                    resp = self._create_embeddings(batch_texts)
                     for j, i in enumerate(batch_idx):
                         vec = list(resp.data[j].embedding)
                         if self._dimension is None and vec:

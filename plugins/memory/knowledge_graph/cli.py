@@ -51,6 +51,7 @@ def _load_bits():
             api_key=emb.get("api_key") or "",
             timeout=float(emb.get("timeout") or 30.0),
             batch_size=int(emb.get("batch_size") or 32),
+            registry_path=emb.get("registry_path") or "",
         )
 
     return Neo4jGraphStore, _neo4j_params, _embed
