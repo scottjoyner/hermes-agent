@@ -67,6 +67,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Neo4j driver for the knowledge-graph memory provider and CLI.
+knowledge-graph = ["neo4j==6.2.0"]
 # Native Anthropic provider — only needed when provider=anthropic (not via
 # OpenRouter or other aggregators).
 anthropic = ["anthropic==0.86.0"]

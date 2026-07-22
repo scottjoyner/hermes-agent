@@ -137,6 +137,24 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
                      help="Parse and report counts without writing to Neo4j")
     p_oc.set_defaults(kg_action="import_opencode")
 
+    p_hs = sub.add_parser(
+        "import-sessions",
+        help="Reconcile Hermes state.db sessions into the graph",
+    )
+    p_hs.add_argument("--db", default="",
+                      help="Path to state.db (default: active Hermes home)")
+    p_hs.add_argument("--since-ts", type=float, default=None,
+                      help="Only sessions whose started_at is at/after this Unix timestamp")
+    p_hs.add_argument("--limit", type=int, default=0,
+                      help="Max sessions to reconcile (0 = all)")
+    p_hs.add_argument("--embed-tools", action="store_true",
+                      help="Also embed tool calls/results")
+    p_hs.add_argument("--no-embed", action="store_true",
+                      help="Write graph structure without embeddings")
+    p_hs.add_argument("--write", action="store_true",
+                      help="Write to Neo4j (default is a dry run)")
+    p_hs.set_defaults(kg_action="import_sessions")
+
     p_exp = sub.add_parser(
         "export-finetune",
         help="Export OpenCode sessions (opencode.db) to a finetuning JSONL corpus",
@@ -332,6 +350,33 @@ def knowledge_graph_command(args: argparse.Namespace) -> None:
                 # Pull the last enqueued job is awkward — instead apply directly:
                 # re-run with the worker pointed at the store.
                 print(f"  {path}: {out}")
+            return
+
+        if action == "import_sessions":
+            import os as _os
+            from hermes_constants import get_hermes_home
+            from plugins.memory.knowledge_graph.session_backfill import import_state_db
+
+            db = args.db or str(get_hermes_home() / "state.db")
+            if not _os.path.exists(db):
+                print(f"  state.db not found at {db}\n")
+                return
+            dry_run = not bool(args.write)
+            embed = None if args.no_embed or dry_run else make_embed()
+            progress: List[str] = []
+            out = import_state_db(
+                store,
+                embed,
+                db,
+                since_ts=args.since_ts,
+                limit_sessions=args.limit or None,
+                embed_tools=bool(args.embed_tools),
+                dry_run=dry_run,
+                progress=progress.append,
+            )
+            for line in progress:
+                print(f"  {line}")
+            print(json.dumps(out, indent=2, default=str))
             return
 
         if action == "import_opencode":
