@@ -418,6 +418,23 @@ def _hermetic_environment(tmp_path, monkeypatch):
     # tests opt back in by patching the security config directly.
     monkeypatch.setenv("TIRITH_ENABLED", "false")
 
+    # 4c. Seal the venv against lazy installs. Importing an opt-in backend
+    #     (plugins.memory.mem0, a TTS/STT provider, a messaging adapter, …)
+    #     calls tools.lazy_deps.ensure(), which shells out to `uv pip install`
+    #     against PyPI. That is a live network dependency inside a unit test:
+    #     it passes in ~17s on a good day and hangs to the 300s per-file
+    #     SIGKILL when PyPI is slow, turning any shard that happens to touch a
+    #     lazy backend red for reasons unrelated to the diff under test.
+    #
+    #     The specs are pinned in LAZY_DEPS and CI installs `--extra all`, so
+    #     anything a test legitimately needs is already present; a lazy
+    #     backend that ISN'T installed should surface as FeatureUnavailable,
+    #     not as a network call. Tests that exercise the install path itself
+    #     stub `_venv_pip_install` / `_allow_lazy_installs` and are unaffected
+    #     by this env var.
+    monkeypatch.setenv("HERMES_DISABLE_LAZY_INSTALLS", "1")
+    monkeypatch.delenv("HERMES_LAZY_INSTALL_TARGET", raising=False)
+
     # 5. Reset plugin singleton so tests don't leak plugins from
     #    ~/.hermes/plugins/ (which, per step 3, is now empty — but the
     #    singleton might still be cached from a previous test).
