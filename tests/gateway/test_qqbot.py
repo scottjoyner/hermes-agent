@@ -1,15 +1,14 @@
 """Tests for the QQ Bot platform adapter."""
 
 import asyncio
-import json
 import os
-import sys
 from types import SimpleNamespace
 from unittest import mock
 
+import httpx
 import pytest
 
-from gateway.config import Platform, PlatformConfig
+from gateway.config import PlatformConfig
 
 
 # ---------------------------------------------------------------------------
@@ -59,7 +58,7 @@ class TestQQAdapterInit:
 
     def test_dm_policy_default(self):
         adapter = self._make(app_id="a", client_secret="b")
-        assert adapter._dm_policy == "open"
+        assert adapter._dm_policy == "pairing"
 
     def test_dm_policy_explicit(self):
         adapter = self._make(app_id="a", client_secret="b", dm_policy="allowlist")
@@ -67,7 +66,7 @@ class TestQQAdapterInit:
 
     def test_group_policy_default(self):
         adapter = self._make(app_id="a", client_secret="b")
-        assert adapter._group_policy == "open"
+        assert adapter._group_policy == "pairing"
 
     def test_allow_from_parsing_string(self):
         adapter = self._make(app_id="a", client_secret="b", allow_from="x, y , z")
@@ -141,14 +140,23 @@ class TestIsVoiceContentType:
     def test_audio_content_type(self):
         assert self._fn("audio/mp3", "file.mp3") is True
 
-    def test_voice_extension(self):
+    def test_voice_extension_fallback_when_content_type_empty(self):
+        """content_type='' with audio extension → True (extension fallback)."""
         assert self._fn("", "file.silk") is True
 
     def test_non_voice(self):
         assert self._fn("image/jpeg", "photo.jpg") is False
 
-    def test_audio_extension_amr(self):
+    def test_audio_extension_amr_fallback_when_content_type_empty(self):
+        """content_type='' with .amr extension → True (extension fallback)."""
         assert self._fn("", "recording.amr") is True
+
+    def test_file_upload_with_audio_extension(self):
+        """content_type='file' is never voice, even with audio extension."""
+        assert self._fn("file", "song.mp3") is False
+        assert self._fn("file", "audio-30251.instrumental..wav") is False
+        assert self._fn("file", "recording.silk") is False
+        assert self._fn("file", "voice.amr") is False
 
 
 # ---------------------------------------------------------------------------
@@ -191,6 +199,88 @@ class TestVoiceAttachmentSSRFProtection:
         kwargs = async_client_cls.call_args.kwargs
         assert kwargs.get("follow_redirects") is True
         assert kwargs.get("event_hooks", {}).get("response") == [_ssrf_redirect_guard]
+
+    def test_connect_accepts_is_reconnect_param(self):
+        """connect() must accept is_reconnect for interface conformance with
+        the base adapter, which the reconnect watcher calls with
+        is_reconnect=True."""
+        from gateway.platforms.qqbot import QQAdapter
+
+        adapter = QQAdapter(_make_config(app_id="a", client_secret="b"))
+        adapter._ensure_token = mock.AsyncMock(side_effect=RuntimeError("stop after client init"))
+
+        # Both forms must not raise TypeError.
+        connected_default = asyncio.run(adapter.connect())
+        connected_explicit = asyncio.run(adapter.connect(is_reconnect=True))
+        assert connected_default is False
+        assert connected_explicit is False
+
+
+# ---------------------------------------------------------------------------
+# Voice attachment temp-file cleanup
+# ---------------------------------------------------------------------------
+
+class TestVoiceAttachmentTempCleanup:
+    def _make_adapter(self, **extra):
+        from gateway.platforms.qqbot import QQAdapter
+        return QQAdapter(_make_config(**extra))
+
+    def _setup_download_mocks(self, adapter, content=b"RIFFmock-wav-audio-data"):
+        response = mock.Mock()
+        response.content = content
+        response.headers = {"content-type": "audio/wav"}
+        response.raise_for_status = mock.Mock()
+
+        adapter._http_client = mock.AsyncMock()
+        adapter._http_client.get = mock.AsyncMock(return_value=response)
+
+    def test_temp_wav_cleaned_up_on_stt_failure(self):
+        adapter = self._make_adapter(app_id="a", client_secret="b")
+        self._setup_download_mocks(adapter)
+        seen = {}
+
+        async def _raise_transport_error(path):
+            seen["wav_path"] = path
+            raise httpx.TransportError("boom")
+
+        with mock.patch("tools.url_safety.is_safe_url", return_value=True):
+            adapter._call_stt = mock.AsyncMock(side_effect=_raise_transport_error)
+            transcript = asyncio.run(
+                adapter._stt_voice_attachment(
+                    "https://cdn.qq.com/voice.silk",
+                    "audio/silk",
+                    "voice.silk",
+                    voice_wav_url="https://cdn.qq.com/voice.wav",
+                )
+            )
+
+        assert transcript is None
+        assert "wav_path" in seen
+        assert not os.path.exists(seen["wav_path"])
+
+    def test_temp_wav_cleaned_up_on_stt_success(self):
+        adapter = self._make_adapter(app_id="a", client_secret="b")
+        self._setup_download_mocks(adapter)
+        seen = {}
+
+        async def _return_transcript(path):
+            seen["wav_path"] = path
+            return "hello from qq voice"
+
+        with mock.patch("tools.url_safety.is_safe_url", return_value=True):
+            adapter._call_stt = mock.AsyncMock(side_effect=_return_transcript)
+            transcript = asyncio.run(
+                adapter._stt_voice_attachment(
+                    "https://cdn.qq.com/voice.silk",
+                    "audio/silk",
+                    "voice.silk",
+                    voice_wav_url="https://cdn.qq.com/voice.wav",
+                )
+            )
+
+        assert transcript == "hello from qq voice"
+        assert "wav_path" in seen
+        assert not os.path.exists(seen["wav_path"])
 
 
 # ---------------------------------------------------------------------------
@@ -269,9 +359,15 @@ class TestDmAllowed:
         from gateway.platforms.qqbot import QQAdapter
         return QQAdapter(_make_config(**extra))
 
-    def test_open_policy(self):
+    def test_open_policy_requires_opt_in(self):
+        adapter = self._make_adapter(app_id="a", client_secret="b", dm_policy="open")
+        assert adapter._is_dm_allowed("any_user") is False
+
+    def test_open_policy_with_opt_in(self, monkeypatch):
+        monkeypatch.setenv("GATEWAY_ALLOW_ALL_USERS", "true")
         adapter = self._make_adapter(app_id="a", client_secret="b", dm_policy="open")
         assert adapter._is_dm_allowed("any_user") is True
+        assert adapter._is_dm_intake_allowed("any_user") is True
 
     def test_disabled_policy(self):
         adapter = self._make_adapter(app_id="a", client_secret="b", dm_policy="disabled")
@@ -311,6 +407,19 @@ class TestGroupAllowed:
         adapter = self._make_adapter(app_id="a", client_secret="b", group_policy="allowlist", group_allow_from="grp1")
         assert adapter._is_group_allowed("grp2", "user1") is False
 
+    def test_pairing_default_blocks_groups(self):
+        adapter = self._make_adapter(app_id="a", client_secret="b")
+        assert adapter._group_policy == "pairing"
+        assert adapter._is_group_allowed("grp1", "user1") is False
+
+    def test_pairing_default_strict_dm_auth_denies_unknown(self):
+        adapter = self._make_adapter(app_id="a", client_secret="b")
+        assert adapter._dm_policy == "pairing"
+        assert adapter._is_dm_allowed("any_user") is False
+
+    def test_pairing_default_forwards_dm_to_gateway_intake(self):
+        adapter = self._make_adapter(app_id="a", client_secret="b")
+        assert adapter._is_dm_intake_allowed("any_user") is True
 
 # ---------------------------------------------------------------------------
 # _resolve_stt_config
@@ -2199,3 +2308,26 @@ class TestCloseCodeClassification:
         assert 4001 in fatal_codes
         assert 4915 in fatal_codes
 
+
+class TestReadEventsClosedWsGuard:
+    """Regression: a closed-but-non-None ws must raise on entry, not return
+    normally, so _listen_loop goes through reconnect/backoff instead of
+    busy-looping at 100% CPU (issues #31193 / #31771)."""
+
+    def _make_adapter(self, **extra):
+        from gateway.platforms.qqbot import QQAdapter
+        return QQAdapter(_make_config(app_id="a", client_secret="b", **extra))
+
+    def test_read_events_raises_when_ws_closed_on_entry(self):
+        adapter = self._make_adapter()
+        adapter._running = True
+        adapter._ws = SimpleNamespace(closed=True)
+        with pytest.raises(RuntimeError):
+            asyncio.run(adapter._read_events())
+
+    def test_read_events_raises_when_ws_none(self):
+        adapter = self._make_adapter()
+        adapter._running = True
+        adapter._ws = None
+        with pytest.raises(RuntimeError):
+            asyncio.run(adapter._read_events())

@@ -10,6 +10,8 @@ Connect Hermes Agent to Microsoft Teams as a bot. Unlike Slack's Socket Mode, Te
 
 Need meeting summaries from Microsoft Graph events rather than normal bot conversations? Use the dedicated setup page: [Teams Meetings](/user-guide/messaging/teams-meetings).
 
+> Run `hermes gateway setup` and pick **Microsoft Teams** for a guided walk-through.
+
 ## How the Bot Responds
 
 | Context | Behavior |
@@ -21,6 +23,15 @@ Need meeting summaries from Microsoft Graph events rather than normal bot conver
 Teams delivers @mentions as regular messages with `<at>BotName</at>` tags, which Hermes strips automatically before processing.
 
 ---
+
+For source or local installs, include the Teams extra so the bundled adapter can
+import the Microsoft Teams SDK:
+
+```bash
+uv sync --extra teams
+# or, for editable installs:
+uv pip install -e ".[teams]"
+```
 
 ## Step 1: Install the Teams CLI
 
@@ -106,7 +117,7 @@ docker logs -f hermes
 
 Look for:
 ```
-[teams] Webhook server listening on 0.0.0.0:3978/api/messages
+[teams] Webhook server listening on * (all interfaces, IPv4+IPv6):3978/api/messages
 ```
 
 ---

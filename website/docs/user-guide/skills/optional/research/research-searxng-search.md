@@ -1,14 +1,14 @@
 ---
-title: "Searxng Search — Free meta-search via SearXNG — aggregates results from 70+ search engines"
+title: "Searxng Search — Free keyless meta-search aggregating 70+ engines"
 sidebar_label: "Searxng Search"
-description: "Free meta-search via SearXNG — aggregates results from 70+ search engines"
+description: "Free keyless meta-search aggregating 70+ engines"
 ---
 
 {/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}
 
 # Searxng Search
 
-Free meta-search via SearXNG — aggregates results from 70+ search engines. Self-hosted or use a public instance. No API key needed. Falls back automatically when the web search toolset is unavailable.
+Free keyless meta-search aggregating 70+ engines.
 
 ## Skill metadata
 
@@ -21,7 +21,7 @@ Free meta-search via SearXNG — aggregates results from 70+ search engines. Sel
 | License | MIT |
 | Platforms | linux, macos |
 | Tags | `search`, `searxng`, `meta-search`, `self-hosted`, `free`, `fallback` |
-| Related skills | [`duckduckgo-search`](/user-guide/skills/optional/research/research-duckduckgo-search), [`domain-intel`](/user-guide/skills/optional/research/research-domain-intel) |
+| Related skills | [`duckduckgo-search`](/docs/user-guide/skills/optional/research/research-duckduckgo-search), [`domain-intel`](/docs/user-guide/skills/optional/research/research-domain-intel) |
 
 ## Reference: full SKILL.md
 

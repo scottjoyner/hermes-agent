@@ -1,0 +1,9 @@
+name: rtk-rewrite
+version: "0.2.0"
+description: "Rewrite eligible Hermes terminal commands through RTK (Rust Token Killer) before execution, reducing noisy CLI output while preserving fail-open behavior. Adds `hermes rtk` setup, status, diagnostics, rewrite preview, and savings commands."
+author: "Scott Joyner / RTK Contributors"
+kind: standalone
+hooks:
+  - pre_tool_call
+provides_hooks:
+  - pre_tool_call

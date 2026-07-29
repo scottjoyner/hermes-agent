@@ -6,12 +6,9 @@ MiniMax allows 10000, and ElevenLabs allows 5000-40000 depending on model.
 """
 
 import json
-from unittest.mock import patch
 
-import pytest
 
 from tools.tts_tool import (
-    ELEVENLABS_MODEL_MAX_TEXT_LENGTH,
     FALLBACK_MAX_TEXT_LENGTH,
     PROVIDER_MAX_TEXT_LENGTH,
     _resolve_max_text_length,
@@ -130,7 +127,7 @@ class TestTextToSpeechToolTruncation:
         text = "A" * 5000
         captured_text = {}
 
-        def fake_openai(t, out, cfg):
+        def fake_openai(t, out, cfg, **_kw):
             captured_text["text"] = t
             with open(out, "wb") as f:
                 f.write(b"\x00")
@@ -178,7 +175,7 @@ class TestTextToSpeechToolTruncation:
         text = "C" * 500
         captured_text = {}
 
-        def fake_openai(t, out, cfg):
+        def fake_openai(t, out, cfg, **_kw):
             captured_text["text"] = t
             with open(out, "wb") as f:
                 f.write(b"\x00")

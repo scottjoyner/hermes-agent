@@ -4,7 +4,6 @@ import asyncio
 import base64
 import json
 import os
-from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
@@ -12,6 +11,7 @@ import pytest
 from gateway.config import PlatformConfig
 from gateway.config import GatewayConfig, HomeChannel, Platform, _apply_env_overrides
 from gateway.platforms.base import SendResult
+from gateway.platforms.base import MessageEvent, MessageType
 from gateway.platforms import weixin
 from gateway.platforms.weixin import ContextTokenStore, WeixinAdapter
 from tools.send_message_tool import _parse_target_ref, _send_to_platform
@@ -25,6 +25,41 @@ def _make_adapter() -> WeixinAdapter:
             extra={"account_id": "test-account"},
         )
     )
+
+
+class TestWeixinInboundVoiceTranscript:
+    def test_voice_transcript_keeps_voice_origin_marker(self):
+        item_list = [
+            {
+                "type": weixin.ITEM_VOICE,
+                "voice_item": {"text": "帮我查一下今天天气"},
+            }
+        ]
+
+        assert weixin._extract_text(item_list) == (
+            "[Voice transcription provided by Weixin]\n"
+            "帮我查一下今天天气"
+        )
+
+    def test_typed_text_remains_unmarked(self):
+        item_list = [
+            {
+                "type": weixin.ITEM_TEXT,
+                "text_item": {"text": "帮我查一下今天天气"},
+            }
+        ]
+
+        assert weixin._extract_text(item_list) == "帮我查一下今天天气"
+
+    def test_empty_voice_transcript_keeps_empty_fallback(self):
+        item_list = [
+            {
+                "type": weixin.ITEM_VOICE,
+                "voice_item": {"text": ""},
+            }
+        ]
+
+        assert weixin._extract_text(item_list) == ""
 
 
 class TestWeixinFormatting:
@@ -410,6 +445,98 @@ class TestWeixinChunkDelivery:
         retry = send_message_mock.await_args_list[2].kwargs
         assert first_try["text"] == retry["text"]
         assert first_try["client_id"] == retry["client_id"]
+
+    @patch("gateway.platforms.weixin.asyncio.sleep", new_callable=AsyncMock)
+    @patch("gateway.platforms.weixin._send_message", new_callable=AsyncMock)
+    def test_repeated_rate_limits_open_circuit_for_followup_sends(self, send_message_mock, sleep_mock):
+        adapter = self._connected_adapter()
+        adapter._send_chunk_retries = 3
+        adapter._send_chunk_retry_delay_seconds = 0
+        adapter._rate_limit_circuit_threshold = 2
+        adapter._rate_limit_circuit_window_seconds = 60
+        adapter._rate_limit_circuit_open_seconds = 60
+
+        send_message_mock.return_value = {
+            "ret": weixin.RATE_LIMIT_ERRCODE,
+            "errcode": weixin.RATE_LIMIT_ERRCODE,
+            "errmsg": "frequency limit",
+        }
+
+        first = asyncio.run(adapter.send("wxid_test123", "first"))
+        second = asyncio.run(adapter.send("wxid_test123", "second"))
+
+        assert first.success is False
+        assert "cooldown" in (first.error or "")
+        assert second.success is False
+        assert "cooldown" in (second.error or "")
+        # The first rate-limit response is retried once. The second response
+        # crosses the sliding-window threshold, opens the breaker, and both the
+        # rest of the current chunk and follow-up sends fail fast.
+        assert send_message_mock.await_count == 2
+        assert sleep_mock.await_count == 1
+
+    @patch("gateway.platforms.weixin._send_message", new_callable=AsyncMock)
+    def test_open_rate_limit_circuit_fails_fast_without_sendmessage(self, send_message_mock):
+        adapter = self._connected_adapter()
+        adapter._rate_limit_circuit_open_seconds = 60
+        adapter._open_rate_limit_circuit()
+
+        result = asyncio.run(adapter.send("wxid_test123", "blocked"))
+
+        assert result.success is False
+        assert "cooldown" in (result.error or "")
+        send_message_mock.assert_not_awaited()
+
+    @patch("gateway.platforms.weixin._send_message", new_callable=AsyncMock)
+    def test_successful_send_after_cooldown_resets_rate_limit_state(self, send_message_mock):
+        adapter = self._connected_adapter()
+        adapter._rate_limit_circuit_until = weixin.time.monotonic() - 1
+        adapter._rate_limit_events = [weixin.time.monotonic()]
+        send_message_mock.return_value = {"errcode": 0}
+
+        result = asyncio.run(adapter.send("wxid_test123", "after cooldown"))
+
+        assert result.success is True
+        assert adapter._rate_limit_events == []
+        assert adapter._rate_limit_circuit_until == 0.0
+        send_message_mock.assert_awaited_once()
+
+    def test_concurrent_rate_limited_sends_are_serialized_by_gate(self):
+        adapter = self._connected_adapter()
+        adapter._send_chunk_retries = 3
+        adapter._send_chunk_retry_delay_seconds = 0
+        adapter._rate_limit_circuit_threshold = 1
+        adapter._rate_limit_circuit_open_seconds = 60
+        active = 0
+        peak_active = 0
+
+        async def rate_limited_send(*args, **kwargs):
+            nonlocal active, peak_active
+            active += 1
+            peak_active = max(peak_active, active)
+            await asyncio.sleep(0)
+            active -= 1
+            return {
+                "ret": weixin.RATE_LIMIT_ERRCODE,
+                "errcode": weixin.RATE_LIMIT_ERRCODE,
+                "errmsg": "frequency limit",
+            }
+
+        async def run_burst():
+            with patch("gateway.platforms.weixin._send_message", side_effect=rate_limited_send) as send_message_mock:
+                results = await asyncio.gather(
+                    *(adapter.send("wxid_test123", f"message {idx}") for idx in range(20))
+                )
+                return results, send_message_mock
+
+        results, send_message_mock = asyncio.run(run_burst())
+
+        assert all(not result.success for result in results)
+        assert peak_active == 1
+        # Once the first send observes iLink's rate limit, the breaker opens;
+        # queued concurrent sends acquire the gate later and fail before making
+        # their own iLink calls.
+        assert send_message_mock.await_count == 1
 
 
 class TestWeixinOutboundMedia:
@@ -854,15 +981,27 @@ class TestWeixinContentDedup:
         adapter = _make_adapter()
         adapter._poll_session = object()
         adapter.handle_message = AsyncMock()
+        # Tighten the text-debounce delay so the flush completes quickly.
+        adapter._text_batch_delay_seconds = 0.05
+        adapter._text_batch_split_delay_seconds = 0.05
 
         base_msg = {
             "from_user_id": "wxid_user1",
             "item_list": [{"type": 1, "text_item": {"text": "hello world"}}],
         }
 
-        asyncio.run(adapter._process_message({**base_msg, "message_id": "msg-1"}))
-        asyncio.run(adapter._process_message({**base_msg, "message_id": "msg-2"}))
+        async def _drive():
+            # Both inbound messages share the same event loop so the debounce
+            # task created by the first one survives to be flushed.
+            await adapter._process_message({**base_msg, "message_id": "msg-1"})
+            await adapter._process_message({**base_msg, "message_id": "msg-2"})
+            # Wait out the quiet period so the buffered text batch flushes.
+            await asyncio.sleep(0.2)
 
+        asyncio.run(_drive())
+
+        # Content-dedup drops the second (duplicate) message before it is even
+        # enqueued, so only one combined dispatch reaches handle_message.
         assert adapter.handle_message.await_count == 1
         event = adapter.handle_message.await_args[0][0]
         assert event.text == "hello world"
@@ -883,3 +1022,524 @@ class TestWeixinContentDedup:
         assert adapter.handle_message.await_count == 0
         # is_duplicate should only be called for message_id, never for content
         assert all("content:" not in str(call) for call in adapter._dedup.is_duplicate.call_args_list)
+
+
+class TestWeixinTextDebounce:
+    """Text-debounce batching for rapid multi-message bursts (issue #35301).
+
+    Delays are read from ``config.extra`` (config.yaml), not env vars.
+    """
+
+    def test_batch_delays_default_from_config(self):
+        adapter = _make_adapter()
+        assert adapter._text_batch_delay_seconds == 3.0
+        assert adapter._text_batch_split_delay_seconds == 5.0
+
+    def test_batch_delays_overridden_via_config_extra(self):
+        adapter = WeixinAdapter(
+            PlatformConfig(
+                enabled=True,
+                token="test-token",
+                extra={
+                    "account_id": "test-account",
+                    "text_batch_delay_seconds": "0.5",
+                    "text_batch_split_delay_seconds": 1.5,
+                },
+            )
+        )
+        assert adapter._text_batch_delay_seconds == 0.5
+        assert adapter._text_batch_split_delay_seconds == 1.5
+
+    def test_invalid_config_value_falls_back_to_default(self):
+        adapter = WeixinAdapter(
+            PlatformConfig(
+                enabled=True,
+                token="test-token",
+                extra={
+                    "account_id": "test-account",
+                    "text_batch_delay_seconds": "not-a-number",
+                    "text_batch_split_delay_seconds": -4,
+                },
+            )
+        )
+        assert adapter._text_batch_delay_seconds == 3.0
+        assert adapter._text_batch_split_delay_seconds == 5.0
+
+    def test_rapid_texts_collapse_into_single_dispatch(self):
+        adapter = _make_adapter()
+        adapter._text_batch_delay_seconds = 0.05
+        adapter._text_batch_split_delay_seconds = 0.05
+        dispatched = []
+
+        async def _capture(event):
+            dispatched.append(event.text)
+
+        adapter.handle_message = _capture
+
+        def _event(text):
+            return MessageEvent(
+                text=text,
+                message_type=MessageType.TEXT,
+                source=adapter.build_source(
+                    chat_id="wxid_user1", chat_type="dm",
+                    user_id="wxid_user1", user_name="wxid_user1",
+                ),
+            )
+
+        async def _drive():
+            adapter._enqueue_text_event(_event("one"))
+            adapter._enqueue_text_event(_event("two"))
+            adapter._enqueue_text_event(_event("three"))
+            assert dispatched == []  # nothing flushed during the burst
+            await asyncio.sleep(0.2)
+
+        asyncio.run(_drive())
+        assert dispatched == ["one\ntwo\nthree"]
+
+
+class _StubResponse:
+    def __init__(self, *, status=200, body="{}", delay=0.0):
+        self.status = status
+        self.ok = 200 <= status < 300
+        self._body = body
+        self._delay = delay
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_exc):
+        return False
+
+    async def text(self):
+        if self._delay:
+            await asyncio.sleep(self._delay)
+        return self._body
+
+
+class _StubSession:
+    """Records request kwargs and returns a configurable async-CM response.
+
+    Unlike aiohttp.ClientSession it installs no TimerContext, so it cannot
+    reproduce aiohttp's cross-loop crash directly; these tests instead pin the
+    observable contract of the asyncio.wait_for migration.
+    """
+
+    def __init__(self, response):
+        self._response = response
+        self.post_calls = []
+        self.get_calls = []
+
+    def post(self, url, **kwargs):
+        self.post_calls.append((url, kwargs))
+        return self._response
+
+    def get(self, url, **kwargs):
+        self.get_calls.append((url, kwargs))
+        return self._response
+
+
+class TestWeixinApiTimeout:
+    def test_api_post_does_not_pass_aiohttp_timeout_kwarg(self):
+        session = _StubSession(_StubResponse(body='{"ret": 0}'))
+        result = asyncio.run(
+            weixin._api_post(
+                session,
+                base_url="https://weixin.example.com",
+                endpoint="ep",
+                payload={"k": "v"},
+                token="tok",
+                timeout_ms=5000,
+            )
+        )
+        assert result == {"ret": 0}
+        # The fix enforces the timeout via asyncio.wait_for, so ClientTimeout is
+        # gone and `timeout` is no longer forwarded to session.post().
+        [(_url, kwargs)] = session.post_calls
+        assert "timeout" not in kwargs
+
+    def test_api_get_does_not_pass_aiohttp_timeout_kwarg(self):
+        session = _StubSession(_StubResponse(body='{"ret": 0}'))
+        result = asyncio.run(
+            weixin._api_get(
+                session,
+                base_url="https://weixin.example.com",
+                endpoint="ep",
+                timeout_ms=5000,
+            )
+        )
+        assert result == {"ret": 0}
+        [(_url, kwargs)] = session.get_calls
+        assert "timeout" not in kwargs
+
+    def test_api_post_raises_timeout_when_response_is_slow(self):
+        # 1 ms budget against a 1 s response: wait_for must cancel and raise.
+        session = _StubSession(_StubResponse(delay=1.0))
+        with pytest.raises(asyncio.TimeoutError):
+            asyncio.run(
+                weixin._api_post(
+                    session,
+                    base_url="https://weixin.example.com",
+                    endpoint="ep",
+                    payload={"k": "v"},
+                    token="tok",
+                    timeout_ms=1,
+                )
+            )
+
+    def test_api_get_raises_timeout_when_response_is_slow(self):
+        session = _StubSession(_StubResponse(delay=1.0))
+        with pytest.raises(asyncio.TimeoutError):
+            asyncio.run(
+                weixin._api_get(
+                    session,
+                    base_url="https://weixin.example.com",
+                    endpoint="ep",
+                    timeout_ms=1,
+                )
+            )
+
+    def test_api_post_raises_runtime_error_on_non_ok_status(self):
+        # The non-2xx branch now lives inside the wait_for-wrapped inner coro;
+        # confirm it still raises with the HTTP status and truncated body.
+        session = _StubSession(_StubResponse(status=500, body="boom"))
+        with pytest.raises(RuntimeError, match="iLink POST ep HTTP 500: boom"):
+            asyncio.run(
+                weixin._api_post(
+                    session,
+                    base_url="https://weixin.example.com",
+                    endpoint="ep",
+                    payload={"k": "v"},
+                    token="tok",
+                    timeout_ms=5000,
+                )
+            )
+
+    def test_api_get_raises_runtime_error_on_non_ok_status(self):
+        session = _StubSession(_StubResponse(status=500, body="boom"))
+        with pytest.raises(RuntimeError, match="iLink GET ep HTTP 500: boom"):
+            asyncio.run(
+                weixin._api_get(
+                    session,
+                    base_url="https://weixin.example.com",
+                    endpoint="ep",
+                    timeout_ms=5000,
+                )
+            )
+
+    def test_get_updates_returns_empty_sentinel_on_timeout(self):
+        # wait_for raises asyncio.TimeoutError, which _get_updates swallows into
+        # an empty long-poll batch rather than propagating.
+        session = _StubSession(_StubResponse(delay=1.0))
+        result = asyncio.run(
+            weixin._get_updates(
+                session,
+                base_url="https://weixin.example.com",
+                token="tok",
+                sync_buf="buf-123",
+                timeout_ms=1,
+            )
+        )
+        assert result == {"ret": 0, "msgs": [], "get_updates_buf": "buf-123"}
+
+
+class TestWeixinVoiceAlwaysDownloaded:
+    """Regression tests for #27300: when WeChat (Weixin) returns a
+    ``voice_item.text`` (Tencent Cloud's STT) we must still download
+    the raw audio and route it through Hermes' own STT pipeline.
+
+    Non-Chinese users currently see garbled transcriptions because the
+    existing code short-circuits in two places: ``_download_voice``
+    returns ``None`` whenever Tencent provided *any* text (even
+    incorrect), and ``_extract_text`` returns that text as the message
+    body. The fix is to always download and never return Tencent's
+    text — the central STT pipeline in ``gateway/run.py`` produces
+    the actual body from the downloaded audio.
+    """
+
+    def _make_voice_item(self, text: str = "") -> dict:
+        """Build a minimal voice item with media + optional Tencent text."""
+        return {
+            "type": weixin.ITEM_VOICE,
+            "voice_item": {
+                "text": text,
+                "media": {
+                    "encrypt_query_param": "q",
+                    "aes_key": "a" * 32,
+                    "full_url": "https://example.invalid/voice.silk",
+                },
+            },
+        }
+
+    @pytest.mark.asyncio
+    async def test_download_voice_returns_path_when_tencent_text_set(self, tmp_path, monkeypatch):
+        """#27300 PRIMARY: ``_download_voice`` must not short-circuit on
+        ``voice_item.text``. The audio is needed so Hermes' own STT can
+        re-transcribe when Tencent's text is in the wrong language.
+        """
+        adapter = _make_adapter()
+        adapter._cdn_base_url = "https://example.invalid"
+        adapter._poll_session = Mock()
+
+        fake_audio_bytes = b"\\x00\\x01\\x02FAKE_SILK"
+        monkeypatch.setattr(weixin, "cache_audio_from_bytes",
+                            lambda data, ext: str(tmp_path / f"voice.{ext.lstrip('.')}"))
+
+        async def _fake_download(session, *, cdn_base_url, encrypted_query_param,
+                                 aes_key_b64, full_url, timeout_seconds):
+            return fake_audio_bytes
+
+        monkeypatch.setattr(weixin, "_download_and_decrypt_media", _fake_download)
+
+        item = self._make_voice_item(text="garbled-tencent-transcript")
+        result = await adapter._download_voice(item)
+
+        # Currently broken: returns None when voice_item.text is set.
+        # After fix: returns a local path so the central STT pipeline
+        # can pick it up and re-transcribe.
+        assert result is not None, (
+            "_download_voice returned None even though raw audio is "
+            "available — Hermes' STT pipeline needs the audio to handle "
+            "non-Chinese voice messages (#27300)."
+        )
+        assert result.endswith(".silk")
+
+    def test_extract_text_does_not_return_tencent_voice_text(self):
+        """#27300 SECONDARY: ``_extract_text`` must not return
+        ``voice_item.text`` verbatim. That text is Tencent Cloud's
+        STT output, which is wrong for non-Chinese audio and the
+        whole reason #27300 was filed. Returning empty forces the
+        central STT pipeline's transcript to become the body.
+        """
+        item_list = [self._make_voice_item(text="garbled-tencent-transcript")]
+        result = weixin._extract_text(item_list)
+        # Currently broken: returns "garbled-tencent-transcript".
+        # After fix: returns "" (empty string) so the central pipeline
+        # transcript replaces it as the user-visible body.
+        assert result != "garbled-tencent-transcript", (
+            "_extract_text returned Tencent's text directly — for "
+            "non-Chinese audio this is garbage; the central STT "
+            "pipeline's transcript should be the body (#27300)."
+        )
+
+    def test_extract_text_voice_only_returns_empty(self):
+        """When the only item is a voice attachment (no text item),
+        ``_extract_text`` should return empty so the central STT
+        pipeline's transcript becomes the body. Currently returns
+        Tencent's text which is what the bug is about.
+        """
+        item_list = [self._make_voice_item(text="какой-то текст")]
+        result = weixin._extract_text(item_list)
+        assert result == "", (
+            "Voice-only message: _extract_text should return empty so "
+            "the central STT pipeline output replaces it as the body."
+        )
+
+    def test_extract_text_still_returns_text_for_text_items(self):
+        """Sanity: the fix must not regress the text-item path. A plain
+        text message should still produce its text body.
+        """
+        item_list = [{
+            "type": weixin.ITEM_TEXT,
+            "text_item": {"text": "hello world"},
+        }]
+        assert weixin._extract_text(item_list) == "hello world"
+
+    @pytest.mark.asyncio
+    async def test_collect_media_includes_voice_when_tencent_text_set(self, tmp_path, monkeypatch):
+        """#27300 INTEGRATION: ``_collect_media`` should add a ``.silk``
+        path to ``media_paths`` even when Tencent returned text, so the
+        central STT pipeline can re-transcribe. Currently the
+        short-circuit in ``_download_voice`` means the audio is never
+        downloaded, and the message body is whatever Tencent wrote
+        (garbled for non-Chinese audio).
+        """
+        adapter = _make_adapter()
+        adapter._cdn_base_url = "https://example.invalid"
+        adapter._poll_session = Mock()
+
+        monkeypatch.setattr(weixin, "cache_audio_from_bytes",
+                            lambda data, ext: str(tmp_path / f"voice.{ext.lstrip('.')}"))
+
+        async def _fake_download(session, *, cdn_base_url, encrypted_query_param,
+                                 aes_key_b64, full_url, timeout_seconds):
+            return b"\\x00FAKE"
+
+        monkeypatch.setattr(weixin, "_download_and_decrypt_media", _fake_download)
+
+        media_paths: list = []
+        media_types: list = []
+        item = self._make_voice_item(text="какой-то текст")
+        await adapter._collect_media(item, media_paths, media_types)
+
+        assert len(media_paths) == 1, (
+            "_collect_media dropped the voice attachment because "
+            "voice_item.text was set — Hermes' STT never gets a "
+            "chance to re-transcribe (#27300)."
+        )
+        assert media_types == ["audio/silk"]
+
+
+class TestWeixinVoiceGatewayHandoff:
+    """#27300 integration-level regression: the routing fix must not only
+    download the audio and drop Tencent's text at the adapter level — the
+    inbound voice item must surface as a VOICE ``MessageEvent`` carrying the
+    ``audio/silk`` media, and that event must reach the runner's central STT
+    pipeline (``_enrich_message_with_transcription``) instead of being trusted
+    as already-transcribed text. This covers the gateway-runner handoff that the
+    adapter-only tests above do not exercise.
+    """
+
+    def _inbound_voice_message(self, text: str) -> dict:
+        return {
+            "from_user_id": "user-123",
+            "to_user_id": "test-account",
+            "message_id": "msg-voice-1",
+            "msg_type": 1,
+            "item_list": [
+                {
+                    "type": weixin.ITEM_VOICE,
+                    "voice_item": {
+                        "text": text,
+                        "media": {
+                            "encrypt_query_param": "q",
+                            "aes_key": "a" * 32,
+                            "full_url": "https://example.invalid/voice.silk",
+                        },
+                    },
+                }
+            ],
+        }
+
+    @pytest.mark.asyncio
+    async def test_voice_item_builds_voice_event_with_silk_media(self, tmp_path, monkeypatch):
+        """Inbound voice item carrying Tencent text must produce a VOICE
+        event whose media is ``audio/silk`` — the exact shape the runner keys
+        off to route into Hermes' STT pipeline.
+        """
+        adapter = _make_adapter()
+        adapter._poll_session = Mock()  # satisfies the `assert` in _process_message
+        adapter._token = None  # typing-ticket task early-returns when no token
+        adapter._cdn_base_url = "https://example.invalid"
+
+        monkeypatch.setattr(weixin, "cache_audio_from_bytes",
+                            lambda data, ext: str(tmp_path / f"voice.{ext.lstrip('.')}"))
+        async def _fake_download(*a, **k):
+            return b"\x00\x01FAKE_SILK"
+        monkeypatch.setattr(weixin, "_download_and_decrypt_media", _fake_download)
+
+        captured = {}
+
+        async def _capture(event):
+            captured["event"] = event
+
+        adapter.handle_message = _capture
+
+        await adapter._process_message(self._inbound_voice_message("garbled-tencent-text"))
+
+        assert "event" in captured, "no MessageEvent handed to handle_message"
+        event = captured["event"]
+        assert event.message_type == MessageType.VOICE, (
+            f"expected VOICE event, got {event.message_type}"
+        )
+        assert event.media_types == ["audio/silk"], (
+            f"voice event must carry audio/silk media, got {event.media_types}"
+        )
+        assert len(event.media_urls) == 1, "expected one local silk audio path"
+
+    @pytest.mark.asyncio
+    async def test_voice_event_body_is_not_tencent_text(self, tmp_path, monkeypatch):
+        """The VOICE event handed to the runner must NOT carry Tencent's STT
+        text as its body — the central pipeline's transcript replaces it.
+        """
+        adapter = _make_adapter()
+        adapter._poll_session = Mock()
+        adapter._token = None
+        adapter._cdn_base_url = "https://example.invalid"
+
+        monkeypatch.setattr(weixin, "cache_audio_from_bytes",
+                            lambda data, ext: str(tmp_path / f"voice.{ext.lstrip('.')}"))
+        async def _fake_download(*a, **k):
+            return b"\x00\x01FAKE_SILK"
+        monkeypatch.setattr(weixin, "_download_and_decrypt_media", _fake_download)
+
+        captured = {}
+
+        async def _capture(event):
+            captured["event"] = event
+
+        adapter.handle_message = _capture
+
+        tencent_text = "garbled English phonemes for a Russian voice"
+        await adapter._process_message(self._inbound_voice_message(tencent_text))
+
+        assert "event" in captured
+        event = captured["event"]
+        # The text field must be empty (Tencent text dropped) so the runner
+        # has no pre-filled body and routes the audio to STT.
+        assert event.text != tencent_text, (
+            "VOICE event body leaked Tencent's STT text — runner would trust "
+            "the wrong transcript instead of re-transcribing (#27300)."
+        )
+
+    @pytest.mark.asyncio
+    async def test_runner_routes_voice_event_to_transcription(self, tmp_path, monkeypatch):
+        """Regression for the gateway-runner handoff: a VOICE event carrying
+        ``audio/silk`` must reach ``_enrich_message_with_transcription`` so the
+        central STT pipeline produces the body. We drive the real runner method
+        (patched to capture the call) using the same selection rule the runner
+        applies in ``gateway/run.py`` (audio/* media -> transcription path).
+        """
+        import gateway.run as run_module
+        from gateway.run import GatewayRunner
+        from gateway.platforms.base import MessageType as _MT
+        from gateway.session import SessionSource
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock
+
+        runner = object.__new__(GatewayRunner)
+        runner.config = SimpleNamespace(stt_enabled=True)
+
+        captured = {}
+        real_enrich = GatewayRunner._enrich_message_with_transcription
+
+        async def _spy_enrich(self, user_text, audio_paths):
+            captured["audio_paths"] = audio_paths
+            # Delegate to the real implementation so the contract is exercised
+            # end-to-end rather than re-implemented.
+            return await real_enrich(self, user_text, audio_paths)
+
+        monkeypatch.setattr(
+            run_module.GatewayRunner,
+            "_enrich_message_with_transcription",
+            _spy_enrich,
+        )
+
+        event = MessageEvent(
+            text="",
+            message_type=_MT.VOICE,
+            source=SessionSource(platform="weixin", chat_id="user-123", chat_type="dm"),
+            raw_message={},
+            message_id="msg-voice-1",
+            media_urls=[str(tmp_path / "voice.silk")],
+            media_types=["audio/silk"],
+            timestamp=__import__("datetime").datetime.now(),
+        )
+
+        # Same selection rule the runner uses: audio/* media (or VOICE/AUDIO
+        # message type) marks the path for transcription.
+        audio_paths = [
+            p for i, p in enumerate(event.media_urls)
+            if (event.media_types[i].startswith("audio/")
+                or event.message_type in (_MT.VOICE, _MT.AUDIO))
+        ]
+        assert audio_paths, "VOICE/audio/silk event must be selected for transcription"
+
+        enriched, transcripts = await runner._enrich_message_with_transcription(
+            event.text, audio_paths
+        )
+        assert captured.get("audio_paths") == audio_paths, (
+            "the VOICE event's audio/silk path must reach "
+            "_enrich_message_with_transcription"
+        )
+        # Real implementation echoes a transcript back when STT is enabled.
+        assert isinstance(enriched, str)

@@ -6,10 +6,24 @@ Exercises the supervisor end-to-end against a real local Chrome
 works, since mock-CDP unit tests can only prove the happy paths we
 thought to model.
 
-Run manually:
-    scripts/run_tests.sh tests/tools/test_browser_supervisor.py
+These tests spawn a **real Chrome process** on the machine running them.
+They are therefore opt-in, twice over:
 
-Automated: skipped in CI unless ``HERMES_E2E_BROWSER=1`` is set.
+* ``@pytest.mark.integration`` — excluded by the default
+  ``addopts = "-m 'not integration'"`` in ``pyproject.toml``, so a bare
+  ``pytest`` cannot launch a browser on a developer's desktop by accident.
+* ``HERMES_E2E_BROWSER=1`` — the env gate this docstring has always claimed.
+  It previously existed only in this prose: nothing read the variable, and
+  the sole real gate was "is a Chrome binary on PATH", which is true on most
+  desktops and on ``ubuntu-latest``. Now it is enforced.
+
+Run manually:
+    HERMES_E2E_BROWSER=1 scripts/run_tests.sh -m integration \\
+        tests/tools/test_browser_supervisor.py
+
+(``scripts/run_tests.sh`` runs under ``env -i`` and forwards
+``HERMES_E2E_BROWSER`` explicitly; ``-m integration`` overrides the default
+marker filter.)
 """
 
 from __future__ import annotations
@@ -26,10 +40,17 @@ import time
 import pytest
 
 
-pytestmark = pytest.mark.skipif(
-    not shutil.which("google-chrome") and not shutil.which("chromium"),
-    reason="Chrome/Chromium not installed",
-)
+pytestmark = [
+    pytest.mark.integration,
+    pytest.mark.skipif(
+        os.environ.get("HERMES_E2E_BROWSER", "").strip() != "1",
+        reason="real-browser E2E: set HERMES_E2E_BROWSER=1 to opt in",
+    ),
+    pytest.mark.skipif(
+        not shutil.which("google-chrome") and not shutil.which("chromium"),
+        reason="Chrome/Chromium not installed",
+    ),
+]
 
 
 def _find_chrome() -> str:
@@ -48,7 +69,6 @@ def chrome_cdp(request):
     Always launches with ``--site-per-process`` so cross-origin iframes
     become real OOPIFs (needed by the iframe interaction tests).
     """
-    import socket
 
     # xdist worker_id is "master" in single-process mode or "gw0".."gwN" otherwise.
     # Under subprocess-per-file isolation there's no xdist, so we fall back
@@ -89,18 +109,45 @@ def chrome_cdp(request):
         except Exception:
             time.sleep(0.25)
     if ws_url is None:
-        proc.terminate()
-        proc.wait(timeout=5)
+        try:
+            proc.terminate()
+            proc.wait(timeout=5)
+        except (subprocess.TimeoutExpired, AssertionError, Exception):
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            try:
+                proc.wait(timeout=2)
+            except (AssertionError, Exception):
+                pass
         shutil.rmtree(profile, ignore_errors=True)
         pytest.skip("Chrome didn't expose CDP in time")
 
     yield ws_url, port
 
-    proc.terminate()
+    # Tear down Chrome. The stdlib `subprocess._wait()` POSIX implementation
+    # has a known race (https://bugs.python.org/issue38630): when SIGCHLD
+    # arrives concurrently with `proc.wait()`, `_try_wait(WNOHANG)` can
+    # return a foreign pid and the `assert pid == self.pid or pid == 0`
+    # fires. We saw this in CI on slice 1 after this fixture's teardown
+    # (PR #33661 follow-up). Swallow the stdlib race + force-kill if wait
+    # hangs, then always reap so we don't leak a zombie.
+    try:
+        proc.terminate()
+    except Exception:
+        pass
     try:
         proc.wait(timeout=3)
-    except Exception:
-        proc.kill()
+    except (subprocess.TimeoutExpired, AssertionError, Exception):
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        try:
+            proc.wait(timeout=2)
+        except (AssertionError, Exception):
+            pass
     shutil.rmtree(profile, ignore_errors=True)
 
 

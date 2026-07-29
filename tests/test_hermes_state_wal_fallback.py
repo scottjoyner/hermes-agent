@@ -71,6 +71,17 @@ def _reset_wal_fallback_warned_paths():
     hermes_state._wal_fallback_warned_paths.clear()
 
 
+@pytest.fixture(autouse=True)
+def _assume_fixed_sqlite(monkeypatch):
+    """NFS-fallback tests assume a SQLite build without the WAL-reset bug."""
+    monkeypatch.setattr(
+        hermes_state, "is_sqlite_wal_reset_vulnerable", lambda version_info=None: False
+    )
+    hermes_state._wal_reset_bug_warned_paths.clear()
+    yield
+    hermes_state._wal_reset_bug_warned_paths.clear()
+
+
 class TestApplyWalWithFallback:
     def test_succeeds_on_local_fs(self, tmp_path):
         """Happy path: WAL works on a normal filesystem."""
@@ -110,14 +121,78 @@ class TestApplyWalWithFallback:
         assert mode == "delete"
         conn.close()
 
-    def test_falls_back_on_disk_io_error(self, tmp_path):
-        """Flaky network FS → disk I/O error → still fall back."""
+    def test_reraises_on_disk_io_error(self, tmp_path):
+        """Transient EIO from ``PRAGMA journal_mode=WAL`` must NOT silently
+        downgrade to DELETE.
+
+        Regression for "Bug D": treating transient EIO as a permanent
+        WAL-incompat marker produced the mixed-journal-mode-across-processes
+        corruption pattern (process A downgrades to DELETE, sibling
+        processes successfully set WAL, SQLite corrupts the file because
+        the two locking protocols are documented as incompatible). EIO is
+        usually transient (page-cache pressure, lock contention, brief
+        storage hiccups); the right behavior is to re-raise so the caller
+        can retry, not to walk the DB into a permanently downgraded state.
+        """
         conn, _ = _open_blocking(
             tmp_path / "flaky.db", reason="disk I/O error", isolation_level=None
         )
-        mode = apply_wal_with_fallback(conn)
-        assert mode == "delete"
+        with pytest.raises(sqlite3.OperationalError, match="disk I/O error"):
+            apply_wal_with_fallback(conn)
         conn.close()
+
+    def test_does_not_downgrade_when_disk_says_wal(self, tmp_path):
+        """Refuse to downgrade an already-WAL DB even if the set-pragma path
+        would have raised a downgrade-eligible marker.
+
+        With the WAL-skip patch, the read-only probe short-circuits before
+        ``PRAGMA journal_mode=WAL`` ever runs on an already-WAL connection,
+        so the set-pragma path is unreachable here and ``attempts`` stays 0.
+        Either outcome (skip-via-probe OR re-raise-on-disk-check) preserves
+        the property this test guards: we never silently DELETE-downgrade
+        a WAL-mode file. The on-disk guard remains in place as
+        belt-and-suspenders for any future code path that bypasses the
+        probe.
+        """
+        # Prime the file in WAL mode using a normal connection
+        primer = sqlite3.connect(
+            str(tmp_path / "already-wal.db"), isolation_level=None
+        )
+        try:
+            primer.execute("PRAGMA journal_mode=WAL")
+            primer.execute("CREATE TABLE t (x INTEGER)")
+            primer.execute("INSERT INTO t VALUES (1)")
+            assert (
+                primer.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
+            )
+        finally:
+            primer.close()
+
+        # New connection whose set-WAL pragma would raise "locking protocol"
+        # if it were ever called. With the WAL-skip patch the probe sees
+        # journal_mode=wal and returns early, so set-WAL is never attempted.
+        conn, attempts = _open_blocking(
+            tmp_path / "already-wal.db",
+            reason="locking protocol",
+            isolation_level=None,
+        )
+        result = apply_wal_with_fallback(conn)
+        assert result == "wal", (
+            "must report wal mode (either skipped via probe or refused downgrade)"
+        )
+        assert attempts[0] == 0, (
+            "set-WAL pragma must not run when the on-disk header already says wal"
+        )
+        conn.close()
+
+        # And the file is STILL WAL on disk — nothing got rewritten
+        check = sqlite3.connect(str(tmp_path / "already-wal.db"))
+        try:
+            assert (
+                check.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
+            )
+        finally:
+            check.close()
 
     def test_reraises_unrelated_operational_error(self, tmp_path):
         """Non-WAL-compat errors must NOT be silently swallowed by the fallback."""
@@ -233,6 +308,9 @@ class TestGetLastInitError:
                 return super().execute(sql, *args, **kwargs)
 
         def gated_connect(*args, **kwargs):
+            # connect_tracked passes a tracking-augmented factory; drop it and
+            # substitute the double, which connect_tracked will re-augment.
+            kwargs.pop("factory", None)
             return real_connect(str(target), factory=_BothPragmasFailConnection, **kwargs)
 
         with patch("hermes_state.sqlite3.connect", side_effect=gated_connect):
@@ -284,6 +362,10 @@ class TestSessionDbUsesWalFallback:
         factory = _make_blocking_factory("locking protocol", attempts)
 
         def gated_connect(*args, **kwargs):
+            # connect_tracked passes a tracking-augmented factory; drop it and
+            # substitute the double, which connect_tracked re-applies to the
+            # returned instance.
+            kwargs.pop("factory", None)
             return real_connect(str(target), factory=factory, **kwargs)
 
         with patch("hermes_state.sqlite3.connect", side_effect=gated_connect):

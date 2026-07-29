@@ -26,9 +26,8 @@ import logging
 import socket as _socket
 import threading
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
-import pytest
 
 
 # ---------------------------------------------------------------------------
@@ -185,7 +184,6 @@ def test_close_from_stranger_thread_aborts_only_no_close():
     the worker's eventual ``finally`` must still see the client in the
     holder so IT can be the one releasing the FD.
     """
-    from agent.chat_completion_helpers import interruptible_api_call
 
     # We can't easily invoke just `_close_request_client_once` because it's
     # a closure local to ``interruptible_api_call``. Re-extract the same
@@ -392,6 +390,32 @@ def test_agent_abort_request_openai_client_does_not_call_client_close(caplog):
         and "deferred_close=stranger_thread" in m
         for m in msgs
     ), f"missing abort log line; got: {msgs!r}"
+
+
+def test_agent_abort_request_openai_client_warns_when_no_sockets(caplog):
+    """tcp_force_closed=0 must not look like a successful abort (#72975)."""
+    from run_agent import AIAgent
+
+    # Client with an empty pool — abort finds nothing to shut down.
+    empty_pool = SimpleNamespace(_connections=[])
+    transport = SimpleNamespace(_pool=empty_pool)
+    http_client = SimpleNamespace(_transport=transport, _mounts={})
+    client = SimpleNamespace(_client=http_client, close=MagicMock())
+
+    agent = AIAgent.__new__(AIAgent)
+    agent._client_log_context = lambda: "provider=test"
+
+    with caplog.at_level(logging.WARNING, logger="run_agent"):
+        agent._abort_request_openai_client(client, reason="stream_interrupt_abort")
+
+    client.close.assert_not_called()
+    msgs = [r.getMessage() for r in caplog.records]
+    assert any(
+        "OpenAI client aborted (stream_interrupt_abort" in m
+        and "tcp_force_closed=0" in m
+        and "no sockets found" in m
+        for m in msgs
+    ), f"missing ineffective-abort WARNING; got: {msgs!r}"
 
 
 def test_agent_abort_request_openai_client_null_client_is_noop():

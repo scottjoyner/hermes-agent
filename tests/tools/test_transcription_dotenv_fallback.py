@@ -27,6 +27,8 @@ def isolate_env(monkeypatch):
         "MISTRAL_API_KEY",
         "XAI_API_KEY",
         "XAI_STT_BASE_URL",
+        "ELEVENLABS_API_KEY",
+        "ELEVENLABS_STT_BASE_URL",
     ):
         monkeypatch.delenv(key, raising=False)
 
@@ -99,12 +101,6 @@ class TestProviderSelectionGate:
             assert tt._get_provider({"enabled": True, "provider": "groq"}) == "groq"
 
     def test_explicit_mistral_sees_dotenv(self):
-        """Mistral STT is intentionally disabled (PyPI quarantine 2026-05-12).
-
-        Even with the dotenv key visible, explicit `provider: mistral` must
-        return "none" with a warning. Restore the previous behavior once
-        `mistralai` is un-quarantined on PyPI.
-        """
         from tools import transcription_tools as tt
 
         with patch.object(tt, "_HAS_FASTER_WHISPER", False), \
@@ -112,7 +108,7 @@ class TestProviderSelectionGate:
              patch.object(tt, "_has_local_command", return_value=False), \
              patch("hermes_cli.config.load_env",
                    return_value={"MISTRAL_API_KEY": "dotenv-secret"}):
-            assert tt._get_provider({"enabled": True, "provider": "mistral"}) == "none"
+            assert tt._get_provider({"enabled": True, "provider": "mistral"}) == "mistral"
 
     def test_explicit_xai_sees_dotenv(self):
         from tools import transcription_tools as tt
@@ -122,6 +118,15 @@ class TestProviderSelectionGate:
              patch("hermes_cli.config.load_env",
                    return_value={"XAI_API_KEY": "dotenv-secret"}):
             assert tt._get_provider({"enabled": True, "provider": "xai"}) == "xai"
+
+    def test_explicit_elevenlabs_sees_dotenv(self):
+        from tools import transcription_tools as tt
+
+        with patch.object(tt, "_HAS_FASTER_WHISPER", False), \
+             patch.object(tt, "_has_local_command", return_value=False), \
+             patch("hermes_cli.config.load_env",
+                   return_value={"ELEVENLABS_API_KEY": "dotenv-secret"}):
+            assert tt._get_provider({"enabled": True, "provider": "elevenlabs"}) == "elevenlabs"
 
     def test_auto_detect_sees_dotenv_groq(self):
         """No local backend, no explicit provider — auto-detect should fall
@@ -200,13 +205,7 @@ class TestTranscribeCallSitesReadDotenv:
         assert seen_keys == ["mistral-dotenv-key"]
 
     def test_transcribe_xai_forwards_dotenv_key(self):
-        """xAI STT now resolves credentials through ``tools.xai_http`` so the
-        OAuth bearer wins when present and ``XAI_API_KEY`` is the fallback.
-        Patch the resolver's ``get_env_value`` to simulate a dotenv-only key
-        and confirm it reaches the HTTP call. The per-call-site
-        ``transcription_tools.get_env_value`` is still consulted for the
-        ``XAI_STT_BASE_URL`` override (covered by ``test_custom_base_url``).
-        """
+        """An explicit XAI_API_KEY must win over Grok subscription OAuth for STT."""
         from tools import transcription_tools as tt
         from tools import xai_http
 
@@ -226,13 +225,45 @@ class TestTranscribeCallSitesReadDotenv:
                 return "xai-dotenv-key"
             return None
 
-        with patch.object(xai_http, "get_env_value", side_effect=fake_get_env_value), \
+        with patch.object(tt, "get_env_value", side_effect=fake_get_env_value), \
+             patch.object(xai_http, "resolve_xai_http_credentials", return_value={
+                 "provider": "xai-oauth",
+                 "api_key": "subscription-oauth-token",
+                 "base_url": "https://api.x.ai/v1",
+             }), \
              patch("requests.post", side_effect=fake_post), \
              patch("builtins.open", MagicMock()):
             result = tt._transcribe_xai("/tmp/fake.mp3", "grok-stt")
 
         assert result["success"] is True
         assert captured["headers"]["Authorization"] == "Bearer xai-dotenv-key"
+
+    def test_transcribe_elevenlabs_forwards_dotenv_key(self):
+        from tools import transcription_tools as tt
+
+        captured: dict = {}
+
+        def fake_post(url, **kwargs):
+            captured["url"] = url
+            captured["headers"] = kwargs.get("headers", {})
+            response = MagicMock()
+            response.status_code = 200
+            response.json.return_value = {"text": "hello"}
+            return response
+
+        def fake_get_env_value(name, default=None):
+            if name == "ELEVENLABS_API_KEY":
+                return "elevenlabs-dotenv-key"
+            return None
+
+        with patch.object(tt, "get_env_value", side_effect=fake_get_env_value), \
+             patch.object(tt, "_load_stt_config", return_value={}), \
+             patch("requests.post", side_effect=fake_post), \
+             patch("builtins.open", MagicMock()):
+            result = tt._transcribe_elevenlabs("/tmp/fake.mp3", "scribe_v2")
+
+        assert result["success"] is True
+        assert captured["headers"]["xi-api-key"] == "elevenlabs-dotenv-key"
 
 
 class TestEndToEndRegressionGuard:

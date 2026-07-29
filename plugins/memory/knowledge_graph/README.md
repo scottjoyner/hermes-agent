@@ -1,93 +1,103 @@
-# Knowledge Graph Session Capture + Backfill
+# Neo4j Knowledge Graph Memory
 
-This plugin captures Hermes sessions into Neo4j as a searchable graph:
+This provider gives Hermes a profile-scoped, cross-session knowledge graph without patching the agent loop or gateway. It implements the current public `MemoryProvider` contract and consumes completed turns through `sync_turn(..., messages=...)`.
 
-- `(:KgSession {id: "sess:<session_id>"})`
-- `(:KgNode {kind: "message"})` for user/assistant messages
-- `(:KgNode {kind: "reasoning"})` for reasoning / CoT fields when capture is enabled
-- `(:KgNode {kind: "toolcall"})` and `(:KgNode {kind: "toolresult"})` for tool provenance
-- `(:KgSession)-[:HAS]->(...)`, `(:Message)-[:FOLLOWED_BY]->(:Message)`,
-  `(:Message)-[:REASONED]->(:Reasoning)`, `(:Message)-[:CALLED]->(:ToolCall)-[:PRODUCED]->(:ToolResult)`
+## Capabilities
 
-## Live session switching
+- Captures sessions, messages, tool calls/results, delegations, ideas, and indexed documents.
+- Writes through a durable SQLite queue under `$HERMES_HOME/knowledge_graph/pending.db` so Neo4j latency or downtime does not block an agent turn.
+- Uses Neo4j full-text search by default.
+- Adds vector search when one or more OpenAI-compatible local embedding endpoints are configured.
+- Fails over through the embedding endpoint list in order.
+- Keeps reasoning, raw tool arguments, and raw tool results disabled by default.
+- Keeps subagent, cron, and flush contexts read-only while preserving graph search and read-only Cypher access.
+- Restricts `kg_query` to read-only Cypher and applies Hermes file-read safety checks during document indexing.
+- Treats same-session transcript rewinds as cache invalidation rather than new session lineage.
 
-`KnowledgeGraphMemoryProvider.on_session_switch()` keeps the provider's cached
-session id in sync when Hermes changes `AIAgent.session_id` without recreating
-the provider, including `/resume`, `/branch`, `/new`, `/reset`, and compression
-continuations.
+## Installation
 
-Switches enqueue an idempotent session upsert with:
-
-- `session_id`
-- `parent_session_id`
-- `platform`
-- `profile`
-- `model`
-- `last_event`
-- `reset`
-
-Lineage is represented as:
-
-- `(:KgSession)-[:DERIVED_TO]->(:KgSession)` for resume/branch/compression-style continuity
-- `(:KgSession)-[:RESET_TO]->(:KgSession)` for explicit reset/new-session boundaries
-
-## Shutdown behavior
-
-`on_session_end()` only marks the session finalized and persists sequence state.
-It deliberately does not replay the entire message list, because live capture ids
-are sequence-derived and a full-tail replay can duplicate message nodes. Use the
-SQLite backfill below for historical repair/reconciliation.
-
-## SQLite `state.db` backfill
-
-`session_backfill.py` imports Hermes' primary SQLite session store into Neo4j.
-It opens the DB read-only and derives stable node ids from SQLite primary keys,
-so it is safe to re-run.
-
-Default embedding policy:
-
-- embedded: user/assistant messages and reasoning fields
-- graph-only: tool calls and tool results
-- optional: set `embed_tools=True` to embed tool call/result content too
-
-Programmatic usage:
-
-```python
-from plugins.memory.knowledge_graph.session_backfill import import_state_db
-
-result = import_state_db(
-    store,
-    embed,
-    "/path/to/state.db",
-    dry_run=True,          # review counts first
-    limit_sessions=100,    # optional incremental run
-)
-```
-
-Agent tool usage once the KG provider is active:
-
-```json
-{"db_path": "/path/to/state.db", "dry_run": true}
-```
-
-via `kg_import_sessions`. The tool defaults to `$HERMES_HOME/state.db` and
-`dry_run=true`; explicitly pass `dry_run=false` to write to Neo4j.
-
-## Verification
-
-Targeted tests:
+The plugin metadata declares the Neo4j Python driver dependency. When installing manually:
 
 ```bash
-uv run --extra dev python -m pytest \
-  tests/plugins/memory/test_knowledge_graph.py \
-  tests/plugins/memory/test_session_backfill.py \
-  tests/plugins/memory/test_opencode_import.py -q
+uv pip install "neo4j>=5.20.0,<6"
 ```
 
-Syntax check:
+A Neo4j 5.x server is required. The account must be able to create constraints and indexes in the configured database.
+
+## Setup
+
+Run the standard memory-provider setup flow:
 
 ```bash
-uv run --extra dev python -m compileall -q \
-  plugins/memory/knowledge_graph \
-  tests/plugins/memory/test_session_backfill.py
+hermes memory setup
 ```
+
+Select `knowledge_graph`, or configure it directly:
+
+```yaml
+memory:
+  provider: knowledge_graph
+
+knowledge_graph:
+  enabled: true
+  uri: bolt://localhost:7687
+  user: neo4j
+  database: neo4j
+  embeddings_base_urls:
+    - http://xwing:1234/v1
+    - http://tie:1234/v1
+  embeddings_model: nomic-embed-text
+  capture_reasoning: false
+  capture_tool_arguments: false
+  capture_tool_results: false
+```
+
+Set the password as a secret rather than committing it:
+
+```bash
+export NEO4J_PASSWORD='replace-me'
+```
+
+Supported environment overrides:
+
+| Variable | Purpose |
+|---|---|
+| `HERMES_KG_ENABLED` | Enable the provider (`true`, `1`, or `yes`) |
+| `NEO4J_URI` | Neo4j Bolt/Neo4j URI |
+| `NEO4J_USER` | Neo4j username |
+| `NEO4J_PASSWORD` | Neo4j password |
+| `NEO4J_DATABASE` | Database name |
+| `HERMES_KG_EMBEDDINGS_URLS` | Comma-separated OpenAI-compatible embedding base URLs |
+| `HERMES_KG_EMBEDDINGS_MODEL` | Embedding model name |
+| `HERMES_KG_EMBEDDINGS_API_KEY` | Optional embedding endpoint key |
+
+`hermes memory setup` writes non-secret provider settings to the active profile's `$HERMES_HOME/knowledge_graph.json`. The durable queue also stays inside that active profile.
+
+## Tools
+
+- `kg_search` — hybrid vector and full-text retrieval.
+- `kg_remember` — store an explicit idea, decision, fact, or insight.
+- `kg_index_docs` — index Markdown, text, and reStructuredText files.
+- `kg_query` — execute bounded read-only Cypher.
+- `kg_forget` — delete a node by stable ID.
+- `kg_status` — report connection state, privacy settings, and queue depth.
+
+In primary agent sessions, all six tools are available. In `subagent`, `cron`, and `flush` contexts, Hermes exposes only `kg_search`, `kg_query`, and `kg_status`; the provider does not create a write queue or accept graph mutations.
+
+## Privacy defaults
+
+The following settings default to `false`:
+
+- `capture_reasoning` prevents model reasoning fields from being persisted.
+- `capture_tool_arguments` replaces raw tool arguments with a redaction marker.
+- `capture_tool_results` replaces raw tool output with an omission marker while preserving the graph relationship between the call and its result.
+
+Enabling these settings can persist sensitive model internals, commands, paths, credentials, file contents, or external service responses. Document indexing follows Hermes' read-deny rules, but the graph database itself should still be treated as sensitive application state.
+
+Boolean configuration accepts normal booleans and common strings such as `true`, `false`, `yes`, `no`, `1`, and `0`. A quoted `"false"` is treated as disabled rather than as a truthy string.
+
+## Failure behavior
+
+Turn capture enqueues locally before Neo4j writes occur. Failed writes stay in SQLite and retry with bounded exponential backoff. Shutdown waits briefly for pending work, then leaves remaining rows durable for the next process start.
+
+Embedding failure does not disable the provider. Search falls back to Neo4j full-text indexes, and write capture continues without vectors.
