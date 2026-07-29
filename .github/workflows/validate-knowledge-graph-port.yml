@@ -40,15 +40,25 @@ jobs:
       - name: Install locked dependencies
         run: uv sync --locked --python 3.11 --extra all --extra dev
 
-      - name: Compile provider
-        run: uv run python -m py_compile plugins/memory/knowledge_graph/__init__.py
+      - name: Compile provider package
+        run: |
+          uv run python -m py_compile \
+            plugins/memory/knowledge_graph/__init__.py \
+            plugins/memory/knowledge_graph/queue_store.py
 
       - name: Lint provider and tests
-        run: uv run ruff check plugins/memory/knowledge_graph/__init__.py tests/plugins/memory/test_knowledge_graph_provider.py
+        run: |
+          uv run ruff check \
+            plugins/memory/knowledge_graph/__init__.py \
+            plugins/memory/knowledge_graph/queue_store.py \
+            tests/plugins/memory/test_knowledge_graph_provider.py
 
       - name: Run focused tests
         env:
           OPENROUTER_API_KEY: ""
           OPENAI_API_KEY: ""
           NOUS_API_KEY: ""
-        run: uv run python -m pytest tests/plugins/memory/test_knowledge_graph_provider.py -q
+        run: |
+          uv run python -m pytest \
+            tests/plugins/memory/test_knowledge_graph_provider.py \
+            -q
