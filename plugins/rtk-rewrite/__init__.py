@@ -17,7 +17,7 @@ import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Sequence
+from typing import Any, Optional, Sequence
 
 _ACCEPTED_REWRITE_RETURN_CODES = {0, 3}
 _EXPECTED_PASSTHROUGH_RETURN_CODES = {1, 2}
@@ -92,6 +92,7 @@ def _run_rtk(
     return subprocess.run(
         [binary, *argv],
         shell=False,
+        stdin=subprocess.DEVNULL,
         timeout=timeout,
         capture_output=True,
         text=True,
@@ -303,7 +304,12 @@ def _cmd_install(method: str) -> int:
         return 1
 
     print(f"$ {shlex.join(command)}")
-    result = subprocess.run(command, shell=False, check=False)
+    result = subprocess.run(
+        command,
+        shell=False,
+        stdin=subprocess.DEVNULL,
+        check=False,
+    )
     _reset_binary_cache()
     if result.returncode != 0:
         print(f"rtk install failed with exit {result.returncode}")
