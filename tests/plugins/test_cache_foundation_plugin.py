@@ -32,6 +32,7 @@ def plugin(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_CACHE_STATE_DB", str(tmp_path / "cache.db"))
     monkeypatch.delenv("HERMES_CACHE_DISABLE", raising=False)
     monkeypatch.delenv("HERMES_CACHE_ALLOW_REMOTE", raising=False)
+    monkeypatch.delenv("HERMES_CACHE_STABLE_PREFIX_FILE", raising=False)
     module = _load_plugin()
     module._reset_store_for_tests()
     return module
@@ -72,18 +73,23 @@ def test_registers_cli_and_both_llm_middleware(plugin):
     assert {calls[1][0], calls[2][0]} == {"llm_request", "llm_execution"}
 
 
-def test_request_middleware_adds_local_headers_and_preserves_existing(plugin):
+def test_request_middleware_adds_authoritative_headers_and_preserves_unrelated(plugin):
     kwargs = _kwargs()
-    kwargs["request"]["extra_headers"] = {"X-Existing": "yes"}
+    kwargs["request"]["extra_headers"] = {
+        "X-Existing": "yes",
+        "X-Hermes-Cache-Checkpoint-Id": "forged",
+        "X-Hermes-Cache-Session-Id": "wrong-session",
+    }
 
     result = plugin._cache_request(**kwargs)
 
     assert result is not None
     request = result["request"]
-    assert request["extra_headers"]["X-Existing"] == "yes"
-    assert request["extra_headers"]["X-Hermes-Cache-Session-Id"] == "session-1"
-    assert "X-Hermes-Cache-Checkpoint-Id" in request["extra_headers"]
-    assert "system prompt" not in str(request["extra_headers"])
+    headers = request["extra_headers"]
+    assert headers["X-Existing"] == "yes"
+    assert headers["X-Hermes-Cache-Session-Id"] == "session-1"
+    assert headers["X-Hermes-Cache-Checkpoint-Id"] != "forged"
+    assert "system prompt" not in str(headers)
     assert plugin._store().affinity("session-1") is not None
 
 
@@ -112,6 +118,75 @@ def test_non_chat_api_modes_are_untouched(plugin):
     kwargs["api_mode"] = "anthropic_messages"
 
     assert plugin._cache_request(**kwargs) is None
+
+
+def test_stable_prefix_file_is_used_only_for_an_exact_request_prefix(
+    plugin,
+    tmp_path,
+    monkeypatch,
+):
+    prefix_file = tmp_path / "stable-prefix.txt"
+    prefix_file.write_text("stable identity and tools", encoding="utf-8")
+    monkeypatch.setenv("HERMES_CACHE_STABLE_PREFIX_FILE", str(prefix_file))
+    plugin._reset_store_for_tests()
+
+    matching = _kwargs(
+        request={
+            "model": "local-model",
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "stable identity and tools\n\nvolatile session A",
+                },
+                {"role": "user", "content": "hello"},
+            ],
+        }
+    )
+    mismatching = _kwargs(
+        request={
+            "model": "local-model",
+            "messages": [
+                {"role": "system", "content": "different system prompt"},
+                {"role": "user", "content": "hello"},
+            ],
+        }
+    )
+
+    matched_manifest = plugin._build_manifest_from_kwargs(matching)
+    mismatched_manifest = plugin._build_manifest_from_kwargs(mismatching)
+
+    assert matched_manifest.source == "runtime-static"
+    assert mismatched_manifest.source == "full-system"
+    status = plugin._stable_prefix_status()
+    assert status["loaded"] is True
+    assert status["chars"] == len("stable identity and tools")
+    assert "stable identity and tools" not in str(status)
+
+
+def test_stable_prefix_file_cache_refreshes_after_file_change(
+    plugin,
+    tmp_path,
+    monkeypatch,
+):
+    prefix_file = tmp_path / "stable-prefix.txt"
+    prefix_file.write_text("first", encoding="utf-8")
+    monkeypatch.setenv("HERMES_CACHE_STABLE_PREFIX_FILE", str(prefix_file))
+    plugin._reset_store_for_tests()
+
+    assert plugin._load_stable_prefix() == "first"
+    prefix_file.write_text("second-prefix", encoding="utf-8")
+    assert plugin._load_stable_prefix() == "second-prefix"
+
+
+def test_pending_manifest_map_is_bounded(plugin, monkeypatch):
+    monkeypatch.setattr(plugin, "_PENDING_LIMIT", 2)
+
+    for index in range(3):
+        kwargs = _kwargs()
+        kwargs["api_request_id"] = f"request-{index}"
+        assert plugin._cache_request(**kwargs) is not None
+
+    assert list(plugin._PENDING) == ["request-1", "request-2"]
 
 
 def test_execution_records_cache_metrics_and_calls_provider_once(plugin):
