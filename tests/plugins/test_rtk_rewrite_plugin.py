@@ -112,6 +112,34 @@ def test_disabled_plugin_keeps_cli_and_skips_hook(monkeypatch):
     assert "pre_tool_call" not in ctx.hooks
 
 
+def test_run_rtk_detaches_from_gateway_stdin():
+    module = load_plugin()
+
+    with (
+        mock.patch.object(
+            module,
+            "_find_binary",
+            return_value="/usr/local/bin/rtk",
+        ),
+        mock.patch.object(
+            module.subprocess,
+            "run",
+            return_value=completed(stdout="rtk 0.28.2\n"),
+        ) as run,
+    ):
+        module._run_rtk(["--version"], timeout=5)
+
+    run.assert_called_once_with(
+        ["/usr/local/bin/rtk", "--version"],
+        shell=False,
+        stdin=subprocess.DEVNULL,
+        timeout=5,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
 def test_rewrite_success_mutates_terminal_command():
     module = load_plugin()
     args = {"command": "git status"}
@@ -299,6 +327,37 @@ def test_install_auto_prefers_brew_then_cargo():
             "--git",
             "https://github.com/rtk-ai/rtk",
         ]
+
+
+def test_install_detaches_from_gateway_stdin(capsys):
+    module = load_plugin()
+
+    with (
+        mock.patch.object(
+            module,
+            "_find_binary",
+            side_effect=[None, "/usr/local/bin/rtk", "/usr/local/bin/rtk"],
+        ),
+        mock.patch.object(
+            module,
+            "_install_command",
+            return_value=["cargo", "install", "--git", "https://github.com/rtk-ai/rtk"],
+        ),
+        mock.patch.object(
+            module.subprocess,
+            "run",
+            return_value=completed(),
+        ) as run,
+    ):
+        assert module._cmd_install("cargo") == 0
+
+    run.assert_called_once_with(
+        ["cargo", "install", "--git", "https://github.com/rtk-ai/rtk"],
+        shell=False,
+        stdin=subprocess.DEVNULL,
+        check=False,
+    )
+    assert "RTK ready" in capsys.readouterr().out
 
 
 def test_rewrite_cli_prints_preview(capsys):
