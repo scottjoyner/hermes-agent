@@ -17,7 +17,7 @@ This provider gives Hermes a profile-scoped, cross-session knowledge graph witho
 The plugin metadata declares the Neo4j Python driver dependency. When installing manually:
 
 ```bash
-uv pip install "neo4j>=5.20.0"
+uv pip install "neo4j>=5.20.0,<6"
 ```
 
 A Neo4j 5.x server is required. The account must be able to create constraints and indexes in the configured database.
