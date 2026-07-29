@@ -2,7 +2,7 @@
 sidebar_position: 12
 sidebar_label: "Built-in Plugins"
 title: "Built-in Plugins"
-description: "Plugins shipped with Hermes Agent that run automatically via lifecycle hooks — disk-cleanup and friends"
+description: "Plugins shipped with Hermes Agent for cache-aware inference, cleanup, security, observability, and more"
 ---
 
 # Built-in Plugins
@@ -55,6 +55,7 @@ The repo ships these bundled plugins under `plugins/`. All are opt-in — enable
 
 | Plugin | Kind | Purpose |
 |---|---|---|
+| `cache-foundation` | LLM middleware + CLI | Deterministic local inference cache manifests, session affinity, prefix warmup, and cache telemetry |
 | `disk-cleanup` | hooks + slash command | Auto-track ephemeral files and clean them on session end |
 | `security-guidance` | hooks | Pattern-match dangerous code on `write_file`/`patch` and append a security warning (or block) — 25 rules (Apache-2.0 fork of Anthropic's `claude-plugins-official` patterns) |
 | `observability/langfuse` | hooks | Trace turns / LLM calls / tools to [Langfuse](https://langfuse.com) |
@@ -68,7 +69,25 @@ The repo ships these bundled plugins under `plugins/`. All are opt-in — enable
 | `hermes-achievements` | dashboard tab | Steam-style collectible badges generated from your real Hermes session history |
 | `kanban/dashboard` | dashboard tab | Kanban board UI for the multi-agent dispatcher — tasks, comments, fan-out, board switching. See [Kanban Multi-Agent](./kanban.md). |
 
-Memory providers (`plugins/memory/*`) and context engines (`plugins/context_engine/*`) are listed separately on [Memory Providers](./memory-providers.md) — they're managed through `hermes memory` and `hermes plugins` respectively. The full per-plugin detail for the two long-running hooks-based plugins follows.
+Memory providers (`plugins/memory/*`) and context engines (`plugins/context_engine/*`) are listed separately on [Memory Providers](./memory-providers.md) — they're managed through `hermes memory` and `hermes plugins` respectively.
+
+### cache-foundation
+
+Adds deterministic identifiers and local operational state for prompt-prefix and KV-cache reuse without coupling the Hermes agent loop to a specific inference engine. It uses LLM request middleware to attach an authoritative cache manifest and LLM execution middleware to record duration, success/failure, and provider-reported cache-read/write tokens.
+
+**Enable and inspect:**
+
+```bash
+hermes plugins enable cache-foundation
+hermes cache status --json
+hermes cache doctor --endpoint http://localhost:1234/v1 --provider lmstudio
+```
+
+By default, cache identifiers are sent only to loopback, private/link-local, LAN, and Tailscale endpoints. A public URL does not become trusted because its provider is labeled `lmstudio` or `ollama`. Trusted remote cache proxies require explicit `HERMES_CACHE_ALLOW_REMOTE=1` opt-in.
+
+For a plain local OpenAI-compatible runtime, `HERMES_CACHE_STABLE_PREFIX_FILE` may point to an exact UTF-8 prefix of the outgoing Hermes system prompt. Hermes uses it only on a byte-for-byte match and stores only hashes and operational metadata — never prompt text, tool payloads, responses, or API keys.
+
+See [Cache-aware inference](./cache-aware-inference.md) for setup, warmup, telemetry interpretation, session affinity, checkpoint evidence states, troubleshooting, and the future fleet/Headroom boundary.
 
 ### disk-cleanup
 
