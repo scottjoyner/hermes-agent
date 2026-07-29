@@ -10,7 +10,9 @@ This provider gives Hermes a profile-scoped, cross-session knowledge graph witho
 - Adds vector search when one or more OpenAI-compatible local embedding endpoints are configured.
 - Fails over through the embedding endpoint list in order.
 - Keeps reasoning, raw tool arguments, and raw tool results disabled by default.
+- Keeps subagent, cron, and flush contexts read-only while preserving graph search and read-only Cypher access.
 - Restricts `kg_query` to read-only Cypher and applies Hermes file-read safety checks during document indexing.
+- Treats same-session transcript rewinds as cache invalidation rather than new session lineage.
 
 ## Installation
 
@@ -80,6 +82,8 @@ Supported environment overrides:
 - `kg_forget` — delete a node by stable ID.
 - `kg_status` — report connection state, privacy settings, and queue depth.
 
+In primary agent sessions, all six tools are available. In `subagent`, `cron`, and `flush` contexts, Hermes exposes only `kg_search`, `kg_query`, and `kg_status`; the provider does not create a write queue or accept graph mutations.
+
 ## Privacy defaults
 
 The following settings default to `false`:
@@ -89,6 +93,8 @@ The following settings default to `false`:
 - `capture_tool_results` replaces raw tool output with an omission marker while preserving the graph relationship between the call and its result.
 
 Enabling these settings can persist sensitive model internals, commands, paths, credentials, file contents, or external service responses. Document indexing follows Hermes' read-deny rules, but the graph database itself should still be treated as sensitive application state.
+
+Boolean configuration accepts normal booleans and common strings such as `true`, `false`, `yes`, `no`, `1`, and `0`. A quoted `"false"` is treated as disabled rather than as a truthy string.
 
 ## Failure behavior
 
