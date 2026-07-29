@@ -1,0 +1,8 @@
+RTK Hermes integration
+
+This plugin integrates with RTK (Rust Token Killer):
+https://github.com/rtk-ai/rtk
+
+RTK is maintained by the RTK Contributors and distributed under the Apache License 2.0. The RTK binary and its Rust filtering implementation are not vendored in this repository. The Hermes adapter invokes RTK's public `rewrite`, `gain`, and version CLI surfaces.
+
+The fail-open pre-tool-call adapter design is compatible with RTK's upstream Hermes plugin under `hooks/hermes/`.

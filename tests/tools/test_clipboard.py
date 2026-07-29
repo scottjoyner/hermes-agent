@@ -13,7 +13,7 @@ import queue
 import subprocess
 import sys
 from pathlib import Path
-from unittest.mock import patch, MagicMock, PropertyMock, mock_open
+from unittest.mock import patch, MagicMock, mock_open
 
 import pytest
 
@@ -1079,7 +1079,12 @@ class TestVoiceSubmission:
                         cli._voice_stop_and_transcribe()
 
         assert cli._attached_images == []
-        assert cli._pending_input.get_nowait() == "hello"
+        queued = cli._pending_input.get_nowait()
+        # Voice transcripts are wrapped in the _VoiceInputMessage sentinel
+        # (#65827) so process_loop can distinguish STT output from typed text.
+        from cli import _VoiceInputMessage
+        assert isinstance(queued, _VoiceInputMessage)
+        assert queued.text == "hello"
 
 
 # ═════════════════════════════════════════════════════════════════════════

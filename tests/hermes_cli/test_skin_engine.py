@@ -1,10 +1,6 @@
 """Tests for hermes_cli.skin_engine — the data-driven skin/theme system."""
 
-import json
-import os
 import pytest
-from pathlib import Path
-from unittest.mock import patch
 
 
 @pytest.fixture(autouse=True)
@@ -52,7 +48,12 @@ class TestBuiltinSkins:
         skin = load_skin("ares")
         assert skin.name == "ares"
         assert skin.tool_prefix == "╎"
-        assert skin.get_color("banner_border") == "#9F1C1C"
+        # Crimson identity: border stays red-dominant (exact values are owned
+        # by the palette audit in test_skin_palettes.py, which enforces
+        # contrast floors — don't pin literals here).
+        border = skin.get_color("banner_border")
+        r, g, b = (int(border[i:i + 2], 16) for i in (1, 3, 5))
+        assert r > g and r > b, f"ares border lost its crimson: {border}"
         assert skin.get_color("response_border") == "#C7A96B"
         assert skin.get_color("session_label") == "#C7A96B"
         assert skin.get_color("session_border") == "#6E584B"
@@ -185,7 +186,7 @@ class TestSkinManagement:
 
 class TestUserSkins:
     def test_load_user_skin_from_yaml(self, tmp_path, monkeypatch):
-        from hermes_cli.skin_engine import load_skin, _skins_dir
+        from hermes_cli.skin_engine import load_skin
         # Create a user skin YAML
         skins_dir = tmp_path / "skins"
         skins_dir.mkdir()

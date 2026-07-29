@@ -30,8 +30,8 @@ binary uploads — images, audio, and video must be reachable HTTPS URLs.
 We register registered tempfiles under ``/line/media/<token>/<filename>``
 served by the same aiohttp app, with an allowed-roots traversal guard.
 ``LINE_PUBLIC_URL`` (e.g. ``https://my-tunnel.example.com``) overrides
-the host:port construction so URLs are reachable when bind is 0.0.0.0
-or behind a reverse proxy.
+the host:port construction so URLs are reachable when the bind is a
+wildcard/dual-stack listener or behind a reverse proxy.
 
 **5-message batching.** LINE accepts at most 5 message objects per
 Reply/Push call; longer responses are smart-chunked at 4500 chars
@@ -71,12 +71,13 @@ import mimetypes
 import os
 import re
 import secrets
+import sys
 import tempfile
 import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 from urllib.parse import quote as _urlquote
 
 logger = logging.getLogger(__name__)
@@ -92,10 +93,12 @@ from gateway.platforms.base import (
     MessageEvent,
     MessageType,
     SendResult,
+    cache_audio_from_bytes,
+    cache_document_from_bytes,
     cache_image_from_bytes,
+    cache_video_from_bytes,
 )
 from gateway.config import Platform
-from gateway.session import SessionSource
 
 
 # ---------------------------------------------------------------------------
@@ -120,6 +123,29 @@ DEFAULT_WEBHOOK_PORT = 8646
 DEFAULT_WEBHOOK_PATH = "/line/webhook"
 DEFAULT_MEDIA_PATH_PREFIX = "/line/media"
 
+# Default bind host. ``None`` tells aiohttp/asyncio's ``create_server`` to
+# bind BOTH address families (IPv4 + IPv6) — the portable dual-stack default.
+# Mirrors gateway/platforms/webhook.py DEFAULT_HOST (commit d542894ad).
+#
+# Why not "0.0.0.0" (the old default) or "::"?
+#   - "0.0.0.0" binds IPv4 ONLY. On IPv6-only private networks — notably
+#     Fly.io 6PN, where the hosted edge router reverse-proxies LINE ingest to
+#     ``<app>.internal:8646`` over an ``fdaa:…`` IPv6 address — an IPv4-only
+#     listener is unreachable: dial refused → customer-visible 502 (NS-603).
+#   - "::" is NOT a safe fix: on hosts where the kernel sets IPV6_V6ONLY=1
+#     (verified on Fly machines), binding "::" yields an IPv6-ONLY socket,
+#     breaking IPv4 loopback health probes.
+#   - ``None`` asks the event loop to create a listening socket per resolved
+#     family, so both 127.0.0.1 (v4) and the 6PN fdaa (v6) are served
+#     regardless of the bindv6only sysctl. Users can still pin a host via
+#     ``LINE_HOST`` or ``platforms.line.extra.host``.
+DEFAULT_HOST = None
+
+# Hosts that mean "listening on every interface" — i.e. the bind address is
+# not a name LINE's servers could ever fetch media from, so a public base URL
+# is required for outbound media.
+_WILDCARD_HOSTS = frozenset({"0.0.0.0", "::", ""})
+
 # Slow-LLM postback button defaults
 DEFAULT_SLOW_RESPONSE_THRESHOLD = 45.0  # seconds; 0 disables
 DEFAULT_PENDING_REPLY_TEXT = (
@@ -133,6 +159,21 @@ DEFAULT_INTERRUPTED_TEXT = "Run was interrupted before completion."
 MEDIA_TOKEN_TTL_SECONDS = 1800  # 30 minutes; LINE caches the URL aggressively
 LINE_IMAGE_MAX_BYTES = 10 * 1024 * 1024  # 10 MB per LINE docs
 LINE_AV_MAX_BYTES = 200 * 1024 * 1024  # 200 MB for voice/video
+
+# Map LINE webhook message types to the normalized MessageType the gateway
+# routes on. LINE has no separate "voice" type — audio messages are recorded
+# voice clips, so they map to VOICE (which the gateway sends through STT),
+# mirroring how Telegram/WhatsApp classify voice notes. Anything unknown
+# falls back to TEXT.
+_LINE_MESSAGE_TYPES = {
+    "text": MessageType.TEXT,
+    "image": MessageType.PHOTO,
+    "video": MessageType.VIDEO,
+    "audio": MessageType.VOICE,
+    "file": MessageType.DOCUMENT,
+    "location": MessageType.LOCATION,
+    "sticker": MessageType.STICKER,
+}
 
 # A 1×1 transparent PNG used as fallback video preview thumbnail when no
 # explicit preview is supplied — LINE requires ``previewImageUrl`` for
@@ -259,7 +300,9 @@ def verify_line_signature(body: bytes, signature: str, channel_secret: str) -> b
         expected = base64.b64encode(digest).decode("utf-8")
     except Exception:
         return False
-    return hmac.compare_digest(expected, signature)
+    # Compare as bytes: compare_digest raises TypeError on a str with
+    # non-ASCII characters, and the signature is a raw request header.
+    return hmac.compare_digest(expected.encode(), signature.encode())
 
 
 # ---------------------------------------------------------------------------
@@ -643,8 +686,12 @@ class LineAdapter(BasePlatformAdapter):
             or extra.get("channel_secret", "")
         )
 
-        # Webhook server
-        self.webhook_host = os.getenv("LINE_HOST") or extra.get("host", "0.0.0.0")
+        # Webhook server. Host default is ``None`` → dual-stack bind (both
+        # IPv4 and IPv6); see DEFAULT_HOST above. ``LINE_HOST``/extra.host pin
+        # a specific address when needed; empty string collapses to None.
+        self.webhook_host = (
+            os.getenv("LINE_HOST") or extra.get("host", DEFAULT_HOST) or DEFAULT_HOST
+        )
         try:
             self.webhook_port = int(
                 os.getenv("LINE_PORT") or extra.get("port", DEFAULT_WEBHOOK_PORT)
@@ -726,7 +773,7 @@ class LineAdapter(BasePlatformAdapter):
     # Connection lifecycle
     # ------------------------------------------------------------------
 
-    async def connect(self) -> bool:
+    async def connect(self, *, is_reconnect: bool = False) -> bool:
         if not self.channel_access_token or not self.channel_secret:
             self._set_fatal_error(
                 "config_missing",
@@ -787,12 +834,26 @@ class LineAdapter(BasePlatformAdapter):
         self._runner = web.AppRunner(self._app)
         try:
             await self._runner.setup()
-            self._site = web.TCPSite(self._runner, self.webhook_host, self.webhook_port)
+            # SO_REUSEADDR is platform-dependent (mirrors the generic webhook
+            # adapter, commits d542894ad/9420ad946):
+            #   - macOS (BSD semantics): two wildcard/specific sockets with
+            #     SO_REUSEADDR can silently split traffic — disable it there.
+            #   - Linux: SO_REUSEADDR only permits rebinding past TIME_WAIT;
+            #     disabling it would make a quick gateway restart fail to
+            #     bind for up to ~60s — keep the default (enabled).
+            self._site = web.TCPSite(
+                self._runner,
+                self.webhook_host,
+                self.webhook_port,
+                reuse_address=False if sys.platform == "darwin" else None,
+            )
             await self._site.start()
         except OSError as exc:
             self._set_fatal_error(
                 "bind_failed",
-                f"Could not bind LINE webhook on {self.webhook_host}:{self.webhook_port}: {exc}",
+                "Could not bind LINE webhook on "
+                f"{self.webhook_host or 'all IPv4+IPv6 interfaces'}:"
+                f"{self.webhook_port}: {exc}",
                 retryable=True,
             )
             return False
@@ -800,7 +861,7 @@ class LineAdapter(BasePlatformAdapter):
         self._mark_connected()
         logger.info(
             "LINE: webhook listening on %s:%s%s%s",
-            self.webhook_host,
+            self.webhook_host or "* (all interfaces, IPv4+IPv6)",
             self.webhook_port,
             self.webhook_path,
             f" (public: {self.public_base_url})" if self.public_base_url else "",
@@ -939,11 +1000,15 @@ class LineAdapter(BasePlatformAdapter):
 
         if msg_type == "text":
             text = msg.get("text", "") or ""
-        elif msg_type in {"image", "audio", "video", "file"}:
-            local_path = await self._download_media(message_id, msg_type)
+        elif msg_type in ("image", "audio", "video", "file"):
+            local_path, media_type = await self._download_media(
+                message_id,
+                msg_type,
+                filename=msg.get("fileName") or msg.get("file_name"),
+            )
             if local_path:
                 media_urls.append(local_path)
-                media_types.append(msg_type)
+                media_types.append(media_type)
             text = f"[{msg_type}]"
         elif msg_type == "sticker":
             keywords = msg.get("keywords") or []
@@ -969,7 +1034,7 @@ class LineAdapter(BasePlatformAdapter):
 
         event_obj = MessageEvent(
             text=text,
-            message_type=MessageType.TEXT if msg_type == "text" else MessageType.IMAGE,
+            message_type=_LINE_MESSAGE_TYPES.get(msg_type, MessageType.TEXT),
             source=source_obj,
             raw_message=event,
             message_id=message_id,
@@ -1038,14 +1103,20 @@ class LineAdapter(BasePlatformAdapter):
             except Exception:
                 pass
 
-    async def _download_media(self, message_id: str, msg_type: str) -> Optional[str]:
+    async def _download_media(
+        self,
+        message_id: str,
+        msg_type: str,
+        *,
+        filename: Optional[str] = None,
+    ) -> Tuple[Optional[str], str]:
         if not self._client or not message_id:
-            return None
+            return None, ""
         try:
             data = await self._client.fetch_content(message_id)
         except Exception as exc:
             logger.warning("LINE: failed to fetch %s content for %s: %s", msg_type, message_id, exc)
-            return None
+            return None, ""
         ext = {
             "image": ".jpg",
             "audio": ".m4a",
@@ -1053,10 +1124,22 @@ class LineAdapter(BasePlatformAdapter):
             "file": ".bin",
         }.get(msg_type, ".bin")
         try:
-            return cache_image_from_bytes(data, ext=ext)
+            if msg_type == "image":
+                return cache_image_from_bytes(data, ext=ext), "image/jpeg"
+            if msg_type == "audio":
+                media_type = mimetypes.guess_type(f"audio{ext}")[0] or "audio/mp4"
+                return cache_audio_from_bytes(data, ext=ext), media_type
+            if msg_type == "video":
+                media_type = mimetypes.guess_type(f"video{ext}")[0] or "video/mp4"
+                return cache_video_from_bytes(data, ext=ext), media_type
+            document_name = filename or f"line_file{ext}"
+            return (
+                cache_document_from_bytes(data, document_name),
+                mimetypes.guess_type(document_name)[0] or "application/octet-stream",
+            )
         except Exception as exc:
             logger.warning("LINE: failed to cache %s payload: %s", msg_type, exc)
-            return None
+            return None, ""
 
     # ------------------------------------------------------------------
     # Outbound send (text)
@@ -1247,7 +1330,12 @@ class LineAdapter(BasePlatformAdapter):
         if self.public_base_url:
             base = self.public_base_url
         else:
+            # A wildcard/dual-stack bind has no fetchable hostname; the
+            # _missing_public_url guard should have caught this earlier.
+            # Fall back to localhost so the URL is at least well-formed.
             host = self.webhook_host
+            if host is None or host in _WILDCARD_HOSTS:
+                host = "127.0.0.1"
             port = self.webhook_port
             if port == 443:
                 base = f"https://{host}"
@@ -1255,6 +1343,14 @@ class LineAdapter(BasePlatformAdapter):
                 base = f"https://{host}:{port}"
         safe_name = _urlquote(filename, safe="")
         return f"{base}{DEFAULT_MEDIA_PATH_PREFIX}/{token}/{safe_name}"
+
+    def _missing_public_url(self) -> bool:
+        """True when outbound media cannot work: no LINE_PUBLIC_URL and the
+        bind host is a wildcard (or the dual-stack ``None`` default), i.e.
+        not an address LINE's fetchers could ever reach."""
+        if self.public_base_url:
+            return False
+        return self.webhook_host is None or self.webhook_host in _WILDCARD_HOSTS
 
     async def _handle_media(self, request) -> Any:
         """Serve a registered local file over HTTPS for LINE's media URLs.
@@ -1317,7 +1413,7 @@ class LineAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="image exceeds 10 MB LINE limit")
         if not self._client:
             return SendResult(success=False, error="LINE adapter not connected")
-        if not self.public_base_url and self.webhook_host == "0.0.0.0":
+        if self._missing_public_url():
             return SendResult(
                 success=False,
                 error="LINE_PUBLIC_URL must be set to send images "
@@ -1347,7 +1443,7 @@ class LineAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="audio exceeds 200 MB LINE limit")
         if not self._client:
             return SendResult(success=False, error="LINE adapter not connected")
-        if not self.public_base_url and self.webhook_host == "0.0.0.0":
+        if self._missing_public_url():
             return SendResult(
                 success=False,
                 error="LINE_PUBLIC_URL must be set to send audio",
@@ -1371,7 +1467,7 @@ class LineAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="video exceeds 200 MB LINE limit")
         if not self._client:
             return SendResult(success=False, error="LINE adapter not connected")
-        if not self.public_base_url and self.webhook_host == "0.0.0.0":
+        if self._missing_public_url():
             return SendResult(
                 success=False,
                 error="LINE_PUBLIC_URL must be set to send video",

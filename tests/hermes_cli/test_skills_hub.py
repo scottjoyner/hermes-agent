@@ -92,7 +92,7 @@ def _capture_update(monkeypatch, results) -> tuple[str, list[tuple[str, str, boo
     monkeypatch.setattr(hub, "HubLockFile", lambda: type("L", (), {
         "get_installed": lambda self, name: {"install_path": "category/" + name}
     })())
-    monkeypatch.setattr(cli_hub, "do_install", lambda identifier, category="", force=False, console=None: installs.append((identifier, category, force)))
+    monkeypatch.setattr(cli_hub, "do_install", lambda identifier, category="", force=False, console=None, source_id=None: installs.append((identifier, category, force)))
 
     do_update(console=console)
     return sink.getvalue(), installs
@@ -249,6 +249,123 @@ def test_do_update_reinstalls_outdated_skills(monkeypatch):
     assert "Updated 1 skill" in output
 
 
+# ---------------------------------------------------------------------------
+# Cross-registry hijack regression tests
+#
+# An update must never change a skill's source registry. Skill names are not
+# namespaced across registries, so an unconstrained name resolve can install a
+# different author's same-named skill over the user's files.
+# ---------------------------------------------------------------------------
+
+
+def test_do_update_pins_install_to_locked_source(monkeypatch):
+    """do_update must forward the lockfile's `source` to do_install.
+
+    Without the pin, a bare identifier like "reddit" reaches
+    _resolve_short_name()'s fuzzy catalog search inside do_install and can
+    resolve to a same-named skill in another registry.
+    """
+    import tools.skills_hub as hub
+    import hermes_cli.skills_hub as cli_hub
+
+    sink = StringIO()
+    console = Console(file=sink, force_terminal=False, color_system=None)
+    calls = []
+
+    monkeypatch.setattr(hub, "check_for_skill_updates", lambda **_kwargs: [
+        {"name": "reddit", "identifier": "reddit", "source": "clawhub",
+         "status": "update_available"},
+    ])
+    monkeypatch.setattr(hub, "HubLockFile", lambda: type("L", (), {
+        "get_installed": lambda self, name: {"install_path": "category/" + name}
+    })())
+    monkeypatch.setattr(
+        cli_hub, "do_install",
+        lambda identifier, category="", force=False, console=None, source_id=None:
+            calls.append({"identifier": identifier, "source_id": source_id}),
+    )
+
+    do_update(console=console)
+
+    assert calls == [{"identifier": "reddit", "source_id": "clawhub"}]
+
+
+def test_do_install_refuses_unknown_pinned_source(monkeypatch, hub_env):
+    """A pinned source with no matching adapter must abort, not fall back.
+
+    Falling back to the full source router is what allowed a foreign registry
+    to satisfy the install.
+    """
+    import tools.skills_hub as hub
+
+    sink = StringIO()
+    console = Console(file=sink, force_terminal=False, color_system=None)
+    resolved = []
+
+    monkeypatch.setattr(hub, "create_source_router", lambda auth=None: [])
+    monkeypatch.setattr(hub, "GitHubAuth", lambda: object())
+    monkeypatch.setattr(
+        "hermes_cli.skills_hub._resolve_short_name",
+        lambda name, sources, c: resolved.append(name) or "",
+    )
+
+    do_install("reddit", source_id="clawhub", console=console)
+
+    assert resolved == [], "must not attempt a fuzzy resolve when the pin is unsatisfiable"
+    assert "provenance" in sink.getvalue()
+
+
+def test_check_for_skill_updates_does_not_fall_back_across_registries():
+    """An entry whose source has no adapter reports `unavailable`.
+
+    Previously `candidate_sources ... or sources` fell back to every source, so
+    a same-named skill in another registry could satisfy the fetch and be
+    reported as this entry's update -- the step that preceded the overwrite.
+    The foreign source here returns a *valid* bundle with a different hash, so
+    the old code reports `update_available` (sourced from the wrong registry)
+    while the fixed code reports `unavailable`.
+    """
+    from tools.skills_hub import check_for_skill_updates
+
+    class _ForeignBundle:
+        name = "reddit"
+        files = {"SKILL.md": "# a different author's reddit skill"}
+        source = "skills.sh"
+        identifier = "skills-sh/someone-else/reddit"
+        trust_level = "community"
+        metadata: dict = {}
+
+    class _ForeignSource:
+        """skills-sh adapter; must NOT be consulted for a clawhub-locked entry."""
+
+        def source_id(self):
+            return "skills-sh"
+
+        def fetch(self, identifier):
+            return _ForeignBundle()
+
+        def inspect(self, identifier):
+            return _ForeignBundle()
+
+    lock = _DummyLockFile([
+        {"name": "reddit", "identifier": "reddit", "source": "clawhub",
+         "content_hash": "hash-of-the-clawhub-copy"},
+    ])
+
+    results = check_for_skill_updates(
+        lock=lock,  # type: ignore[arg-type]  # duck-typed double, matches _DummyLockFile usage above
+        sources=[_ForeignSource()],  # type: ignore[list-item]
+    )
+
+    assert len(results) == 1
+    assert results[0]["source"] == "clawhub", "provenance must be preserved"
+    assert results[0]["status"] == "unavailable", (
+        "a clawhub-locked skill must not be matched against a skills-sh bundle; "
+        "reporting update_available here is the cross-registry hijack"
+    )
+    assert "bundle" not in results[0], "must not carry a foreign registry's bundle"
+
+
 def test_handle_skills_slash_search_accepts_chatconsole_without_status_errors():
     results = [type("R", (), {
         "name": "kubernetes",
@@ -369,6 +486,39 @@ def test_do_install_scans_official_bundles_with_source_provenance(
     do_install("official/agent/prunus-gaia", console=console, skip_confirm=True)
 
     assert scanned["source"] == "official"
+
+
+def test_do_install_preserves_nested_official_optional_path(
+    monkeypatch, tmp_path, hub_env
+):
+    class _OfficialNestedSource:
+        def inspect(self, identifier):
+            return type("Meta", (), {
+                "extra": {},
+                "identifier": "official/mlops/training/trl-fine-tuning",
+            })()
+
+        def fetch(self, identifier):
+            return type("Bundle", (), {
+                "name": "trl-fine-tuning",
+                "files": {"SKILL.md": "# TRL"},
+                "source": "official",
+                "identifier": "official/mlops/training/trl-fine-tuning",
+                "trust_level": "builtin",
+                "metadata": {},
+            })()
+
+    installs = _install_mocks(monkeypatch, tmp_path, _OfficialNestedSource)
+
+    sink = StringIO()
+    console = Console(file=sink, force_terminal=False, color_system=None)
+    do_install(
+        "official/mlops/training/trl-fine-tuning",
+        console=console,
+        skip_confirm=True,
+    )
+
+    assert installs == [{"name": "trl-fine-tuning", "category": "mlops/training"}]
 
 
 # ---------------------------------------------------------------------------
@@ -618,3 +768,133 @@ def test_browse_skills_dedup_uses_identifier_not_name(monkeypatch):
         "browse_skills() must not deduplicate browse-sh skills with the same name "
         "but different identifiers"
     )
+
+
+def test_do_browse_reports_live_per_source_progress():
+    """do_browse must pass an on_source_done callback so the status line ticks
+    off each source as it resolves, instead of showing a frozen spinner while
+    a slow source blocks. The page is still rendered once, after the full
+    result set is merged and trust-sorted."""
+    from hermes_cli.skills_hub import do_browse
+    from tools.skills_hub import SkillMeta
+
+    meta = SkillMeta(
+        name="demo", description="d", source="official",
+        identifier="official/demo", trust_level="builtin",
+    )
+
+    captured = {}
+
+    def fake_parallel(sources, query="", per_source_limits=None,
+                      source_filter="all", overall_timeout=30,
+                      on_source_done=None):
+        # Simulate two sources completing — the callback must be wired through.
+        assert on_source_done is not None, "do_browse must pass on_source_done"
+        on_source_done("official", 1)
+        on_source_done("clawhub", 0)
+        captured["called"] = True
+        return [meta], {"official": 1, "clawhub": 0}, []
+
+    sink = StringIO()
+    console = Console(file=sink, force_terminal=False, color_system=None, width=120)
+
+    with patch("tools.skills_hub.create_source_router", return_value=[]), \
+         patch("tools.skills_hub.GitHubAuth"), \
+         patch("tools.skills_hub.parallel_search_sources", side_effect=fake_parallel):
+        do_browse(page=1, page_size=20, console=console)
+
+    assert captured.get("called"), "parallel_search_sources was not invoked"
+    # The rendered page still shows the (single) merged result.
+    assert "demo" in sink.getvalue()
+
+
+# ---------------------------------------------------------------------------
+# Regression: full identifier must be recoverable from `hermes skills search`
+# even when the slug is too long to fit the terminal width (issue #33674).
+# ---------------------------------------------------------------------------
+
+# A real browse-sh-style slug whose trailing -XXXXXX hash matters for install
+_LONG_SLUG = "browse-sh/weather.gov/get-forecast-1uezib"
+
+_LONG_RESULT = type("R", (), {
+    "name": "get-forecast",
+    "description": "Fetch the forecast",
+    "source": "browse-sh",
+    "trust_level": "community",
+    "identifier": _LONG_SLUG,
+})()
+
+
+def test_do_search_identifier_column_does_not_truncate_long_slug():
+    """The Identifier column must use overflow='fold', not the default ellipsis.
+
+    Renders into a deliberately narrow Console; the full slug (including the
+    trailing -1uezib hash) must still appear in the output. Before the fix,
+    Rich would render `browse-sh/weather…` and lose the hash.
+    """
+    from hermes_cli.skills_hub import do_search
+
+    sink = StringIO()
+    # Narrow width forces Rich to apply overflow rules — exactly the scenario
+    # the issue reports. width=40 is too small for the slug; we want the slug
+    # wrapped (not ellipsis-truncated).
+    console = Console(file=sink, force_terminal=False, color_system=None, width=40)
+
+    with patch("tools.skills_hub.unified_search", return_value=[_LONG_RESULT]), \
+         patch("tools.skills_hub.create_source_router", return_value={}), \
+         patch("tools.skills_hub.GitHubAuth"):
+        do_search("weather", console=console)
+
+    output = sink.getvalue()
+
+    # The fix is working when the Identifier column wraps the slug across
+    # multiple lines (folded chunks) rather than emitting ONE line with an
+    # ellipsis. Extract every chunk that appears in the rightmost cell of
+    # the table by walking lines that look like table rows ("│ ... │") and
+    # taking the last `│...│` cell. Concatenating those chunks must yield
+    # the full slug.
+    chunks = []
+    for line in output.splitlines():
+        # Table data rows start and end with the box-drawing vertical bar.
+        if not line.startswith("│") or not line.rstrip().endswith("│"):
+            continue
+        # Last `│ ... │` cell on the row is the Identifier column.
+        last_cell = line.rstrip().rsplit("│", 2)[-2].strip()
+        if last_cell:
+            chunks.append(last_cell)
+    reconstructed = "".join(chunks)
+    assert _LONG_SLUG in reconstructed, (
+        f"Expected full slug {_LONG_SLUG!r} to be recoverable from the "
+        f"folded Identifier column; got chunks {chunks!r}\n"
+        f"Full output:\n{output}"
+    )
+    # And the truncating ellipsis must NOT appear in the Identifier column.
+    # Rich uses U+2026 HORIZONTAL ELLIPSIS for the default overflow="ellipsis".
+    assert "\u2026" not in reconstructed, (
+        f"Identifier column still ellipsis-truncated: {reconstructed!r}"
+    )
+
+
+def test_do_search_json_flag_emits_full_identifiers(capsys):
+    """`--json` must print a parseable array with full identifiers and skip the table."""
+    from hermes_cli.skills_hub import do_search
+
+    sink = StringIO()
+    console = Console(file=sink, force_terminal=False, color_system=None, width=40)
+
+    with patch("tools.skills_hub.unified_search", return_value=[_LONG_RESULT]), \
+         patch("tools.skills_hub.create_source_router", return_value={}), \
+         patch("tools.skills_hub.GitHubAuth"):
+        do_search("weather", console=console, as_json=True)
+
+    # JSON goes to stdout via print(), not the Rich console sink.
+    captured = capsys.readouterr().out
+    import json as _json
+    payload = _json.loads(captured)
+    assert isinstance(payload, list) and len(payload) == 1
+    assert payload[0]["identifier"] == _LONG_SLUG
+    assert payload[0]["name"] == "get-forecast"
+    assert payload[0]["source"] == "browse-sh"
+    # Table render must be suppressed — sink should be empty (no "Searching for:" header).
+    assert "Searching for:" not in sink.getvalue()
+

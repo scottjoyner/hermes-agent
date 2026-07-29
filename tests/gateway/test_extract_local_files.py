@@ -8,7 +8,6 @@ deduplication, text cleanup, and extension routing.
 Based on PR #1636 by sudoingX (salvaged + hardened).
 """
 
-import os
 from unittest.mock import patch
 
 import pytest
@@ -100,7 +99,7 @@ class TestBasicDetection:
 
     def test_audio_extensions(self):
         """Audio files are detected and routed by the gateway dispatch."""
-        for ext in (".mp3", ".wav", ".ogg", ".m4a", ".flac"):
+        for ext in (".mp3", ".m2a", ".wav", ".ogg", ".m4a", ".flac"):
             text = f"Audio at /tmp/sound{ext} ready"
             paths, _ = _extract(text)
             assert len(paths) == 1, f"Failed for {ext}"
@@ -337,9 +336,35 @@ class TestEdgeCases:
         paths, _ = _extract("File at /tmp/my file.png here")
         assert paths == []
 
-    def test_windows_path_not_matched(self):
-        """Windows-style paths should not match."""
-        paths, _ = _extract("See C:\\Users\\test\\image.png")
+    @pytest.mark.parametrize(
+        "content,expected",
+        [
+            # Backslash separators (native Windows style)
+            ("See C:\\Users\\test\\image.png here", "C:\\Users\\test\\image.png"),
+            # Forward slashes with drive letter (common in cross-platform code)
+            ("See C:/Users/test/image.png here", "C:/Users/test/image.png"),
+            # Non-C: drive
+            ("Video at D:/data/clip.mp4 ready", "D:/data/clip.mp4"),
+            # Lowercase drive letter
+            ("Path e:/audio/track.mp3 done", "e:/audio/track.mp3"),
+        ],
+    )
+    def test_windows_drive_letter_paths_matched(self, content, expected):
+        """Windows drive-letter paths (C:/..., C:\\...) must be detected (#34632).
+
+        Prior behavior anchored on (?:~/|/) only, which silently dropped
+        Windows absolute paths so the agent's bare-path references were
+        sent as text instead of native uploads.
+        """
+        paths, cleaned = _extract(content)
+        assert paths == [expected]
+        assert expected not in cleaned
+
+    def test_relative_windows_path_not_matched(self):
+        """A bare Windows-style filename without a drive letter must still
+        not match (e.g. ``foo\\bar.png`` is treated as relative, like its
+        Unix sibling ``foo/bar.png``)."""
+        paths, _ = _extract("File at foo\\bar.png here")
         assert paths == []
 
     def test_relative_path_not_matched(self):

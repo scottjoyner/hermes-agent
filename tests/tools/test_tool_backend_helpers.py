@@ -16,10 +16,12 @@ from unittest.mock import patch
 
 import pytest
 
+from hermes_cli.nous_account import NousPaidServiceAccessInfo, NousPortalAccountInfo
 from tools.tool_backend_helpers import (
     coerce_modal_mode,
     has_direct_modal_credentials,
     managed_nous_tools_enabled,
+    nous_tool_gateway_unavailable_message,
     normalize_browser_cloud_provider,
     normalize_modal_mode,
     prefers_gateway,
@@ -40,40 +42,91 @@ class TestManagedNousToolsEnabled:
 
     def test_disabled_when_not_logged_in(self, monkeypatch):
         monkeypatch.setattr(
-            "hermes_cli.auth.get_nous_auth_status",
-            lambda: {},
+            "hermes_cli.nous_account.get_nous_portal_account_info",
+            lambda: NousPortalAccountInfo(logged_in=False, source="none", fresh=False),
         )
         assert managed_nous_tools_enabled() is False
 
     def test_disabled_for_free_tier(self, monkeypatch):
         monkeypatch.setattr(
-            "hermes_cli.auth.get_nous_auth_status",
-            lambda: {"logged_in": True},
-        )
-        monkeypatch.setattr(
-            "hermes_cli.models.check_nous_free_tier",
-            lambda: True,
+            "hermes_cli.nous_account.get_nous_portal_account_info",
+            lambda: NousPortalAccountInfo(
+                logged_in=True,
+                source="jwt",
+                fresh=False,
+                paid_service_access=False,
+            ),
         )
         assert managed_nous_tools_enabled() is False
 
     def test_enabled_for_paid_subscriber(self, monkeypatch):
         monkeypatch.setattr(
-            "hermes_cli.auth.get_nous_auth_status",
-            lambda: {"logged_in": True},
-        )
-        monkeypatch.setattr(
-            "hermes_cli.models.check_nous_free_tier",
-            lambda: False,
+            "hermes_cli.nous_account.get_nous_portal_account_info",
+            lambda: NousPortalAccountInfo(
+                logged_in=True,
+                source="jwt",
+                fresh=False,
+                paid_service_access=True,
+            ),
         )
         assert managed_nous_tools_enabled() is True
+
+    def test_force_fresh_is_forwarded(self, monkeypatch):
+        calls = []
+
+        def fake_account_info(*, force_fresh=False):
+            calls.append(force_fresh)
+            return NousPortalAccountInfo(
+                logged_in=True,
+                source="account_api",
+                fresh=True,
+                paid_service_access=True,
+            )
+
+        monkeypatch.setattr(
+            "hermes_cli.nous_account.get_nous_portal_account_info",
+            fake_account_info,
+        )
+
+        assert managed_nous_tools_enabled(force_fresh=True) is True
+        assert calls == [True]
 
     def test_returns_false_on_exception(self, monkeypatch):
         """Should never crash — returns False on any exception."""
         monkeypatch.setattr(
-            "hermes_cli.auth.get_nous_auth_status",
+            "hermes_cli.nous_account.get_nous_portal_account_info",
             _raise_import,
         )
         assert managed_nous_tools_enabled() is False
+
+
+class TestNousToolGatewayUnavailableMessage:
+    def test_uses_entitlement_reason_for_logged_in_user(self, monkeypatch):
+        monkeypatch.setattr(
+            "hermes_cli.nous_account.get_nous_portal_account_info",
+            lambda force_fresh=False: NousPortalAccountInfo(
+                logged_in=True,
+                source="account_api",
+                fresh=True,
+                paid_service_access=False,
+                portal_base_url="https://portal.example.test",
+                paid_service_access_info=NousPaidServiceAccessInfo(
+                    allowed=False,
+                    reason="no_usable_credits",
+                    has_active_subscription=True,
+                    active_subscription_is_paid=True,
+                    subscription_credits_remaining=0,
+                    purchased_credits_remaining=0,
+                    total_usable_credits=0,
+                ),
+            ),
+        )
+
+        message = nous_tool_gateway_unavailable_message("managed image generation")
+
+        assert "credits are exhausted" in message
+        assert "managed image generation" in message
+        assert "https://portal.example.test/billing" in message
 
 
 # ---------------------------------------------------------------------------
@@ -187,6 +240,20 @@ class TestHasDirectModalCredentials:
         monkeypatch.setenv("MODAL_TOKEN_SECRET", "sec-456")
         (tmp_path / ".modal.toml").touch()
         with patch.object(Path, "home", return_value=tmp_path):
+            assert has_direct_modal_credentials() is True
+
+    def test_home_dir_permission_denied(self, monkeypatch):
+        """PermissionError on Path.home() should not crash (issue #33525)."""
+        monkeypatch.delenv("MODAL_TOKEN_ID", raising=False)
+        monkeypatch.delenv("MODAL_TOKEN_SECRET", raising=False)
+        with patch.object(Path, "home", side_effect=PermissionError("denied")):
+            assert has_direct_modal_credentials() is False
+
+    def test_home_dir_permission_denied_with_env_vars(self, monkeypatch):
+        """PermissionError on Path.home() should not prevent env var detection."""
+        monkeypatch.setenv("MODAL_TOKEN_ID", "id-123")
+        monkeypatch.setenv("MODAL_TOKEN_SECRET", "sec-456")
+        with patch.object(Path, "home", side_effect=PermissionError("denied")):
             assert has_direct_modal_credentials() is True
 
 
@@ -334,3 +401,73 @@ class TestResolveOpenaiAudioApiKey:
         monkeypatch.setenv("VOICE_TOOLS_OPENAI_KEY", "  voice-key  ")
         monkeypatch.delenv("OPENAI_API_KEY", raising=False)
         assert resolve_openai_audio_api_key() == "voice-key"
+
+
+# ---------------------------------------------------------------------------
+# resolve_openai_audio_api_key — profile secret scope
+# ---------------------------------------------------------------------------
+class TestResolveOpenaiAudioApiKeyIsProfileScoped:
+    """The key this returns authenticates the TTS/STT client.
+
+    In a multiplex gateway ``os.environ`` holds whichever profile's ``.env``
+    loaded at boot, not the profile the current turn belongs to — so a raw
+    read here would let one profile's voice reply or voice-note transcription
+    run on (and be billed to) another profile's OpenAI account. Same contract
+    ``agent/vertex_adapter`` and the WeChat send path already follow.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _reset_multiplex(self):
+        from agent import secret_scope as ss
+
+        ss.set_multiplex_active(False)
+        yield
+        ss.set_multiplex_active(False)
+
+    def test_scope_wins_over_another_profiles_environ(self, monkeypatch):
+        from agent import secret_scope as ss
+
+        monkeypatch.delenv("VOICE_TOOLS_OPENAI_KEY", raising=False)
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-other-profile")
+        ss.set_multiplex_active(True)
+        token = ss.set_secret_scope({"OPENAI_API_KEY": "sk-this-profile"})
+        try:
+            assert resolve_openai_audio_api_key() == "sk-this-profile", (
+                "voice/STT authenticated with another profile's OpenAI key"
+            )
+        finally:
+            ss.reset_secret_scope(token)
+
+    def test_scope_miss_does_not_borrow_another_profiles_key(self, monkeypatch):
+        """Under multiplexing an absent key must stay absent, not fall through."""
+        from agent import secret_scope as ss
+
+        monkeypatch.delenv("VOICE_TOOLS_OPENAI_KEY", raising=False)
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-other-profile")
+        ss.set_multiplex_active(True)
+        token = ss.set_secret_scope({"UNRELATED": "x"})
+        try:
+            assert resolve_openai_audio_api_key() == ""
+        finally:
+            ss.reset_secret_scope(token)
+
+    def test_voice_key_precedence_holds_inside_a_scope(self, monkeypatch):
+        from agent import secret_scope as ss
+
+        monkeypatch.delenv("VOICE_TOOLS_OPENAI_KEY", raising=False)
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        ss.set_multiplex_active(True)
+        token = ss.set_secret_scope({
+            "VOICE_TOOLS_OPENAI_KEY": "sk-voice",
+            "OPENAI_API_KEY": "sk-general",
+        })
+        try:
+            assert resolve_openai_audio_api_key() == "sk-voice"
+        finally:
+            ss.reset_secret_scope(token)
+
+    def test_single_profile_still_reads_environ(self, monkeypatch):
+        """Control: no multiplexing, no scope — unchanged behaviour."""
+        monkeypatch.delenv("VOICE_TOOLS_OPENAI_KEY", raising=False)
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-plain")
+        assert resolve_openai_audio_api_key() == "sk-plain"
