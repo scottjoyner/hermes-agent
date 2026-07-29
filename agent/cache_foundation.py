@@ -1,6 +1,6 @@
 """Engine-neutral prefix-cache manifests, affinity state, and route scoring.
 
-This module deliberately does not serialize model KV tensors.  It defines the
+This module deliberately does not serialize model KV tensors. It defines the
 stable contract between Hermes and an inference server or cache-aware proxy:
 
 * deterministic request and checkpoint identifiers;
@@ -8,7 +8,7 @@ stable contract between Hermes and an inference server or cache-aware proxy:
 * durable session affinity, checkpoint inventory, and request telemetry;
 * a backend-neutral route scoring model.
 
-Only hashes and operational metadata are persisted.  Prompt text, tool payloads,
+Only hashes and operational metadata are persisted. Prompt text, tool payloads,
 API keys, and provider responses are never written to the cache database.
 """
 
@@ -32,6 +32,7 @@ CACHE_SCHEMA_VERSION = "hermes.cache.v1"
 _HEADER_PREFIX = "X-Hermes-Cache-"
 _TRUE_VALUES = {"1", "true", "yes", "on"}
 _DB_LOCK = threading.RLock()
+_TAILSCALE_NETWORK = ipaddress.ip_network("100.64.0.0/10")
 
 
 def _truthy(value: Any) -> bool:
@@ -39,12 +40,7 @@ def _truthy(value: Any) -> bool:
 
 
 def _canonical_json(value: Any) -> str:
-    """Return stable JSON while preserving list order.
-
-    Dictionary key ordering is irrelevant to JSON semantics, while list order is
-    load-bearing for message and tool-schema serialization.  ``sort_keys`` gives
-    stable mapping hashes without accidentally reordering message arrays.
-    """
+    """Return stable JSON while preserving list order."""
 
     return json.dumps(
         value,
@@ -56,7 +52,9 @@ def _canonical_json(value: Any) -> str:
 
 
 def hash_text(value: str) -> str:
-    return hashlib.sha256(value.encode("utf-8", errors="surrogatepass")).hexdigest()
+    return hashlib.sha256(
+        value.encode("utf-8", errors="surrogatepass")
+    ).hexdigest()
 
 
 def hash_json(value: Any) -> str:
@@ -73,20 +71,19 @@ def _content_text(content: Any) -> str:
     for part in content:
         if isinstance(part, str):
             parts.append(part)
-            continue
-        if not isinstance(part, Mapping):
+        elif isinstance(part, Mapping):
+            text = part.get("text")
+            if isinstance(text, str):
+                parts.append(text)
+            elif isinstance(part.get("content"), str):
+                parts.append(str(part["content"]))
+        else:
             parts.append(str(part))
-            continue
-        text = part.get("text")
-        if isinstance(text, str):
-            parts.append(text)
-        elif isinstance(part.get("content"), str):
-            parts.append(str(part["content"]))
     return "".join(parts)
 
 
 def _decorated_static_prefix(content: Any) -> str:
-    """Extract Hermes' independently cached static system part when available."""
+    """Extract Hermes' independently decorated static system part."""
 
     if not isinstance(content, list) or not content:
         return ""
@@ -105,9 +102,7 @@ def _request_messages(request: Mapping[str, Any]) -> list[Any]:
     if isinstance(messages, list):
         return messages
     items = request.get("input")
-    if isinstance(items, list):
-        return items
-    return []
+    return items if isinstance(items, list) else []
 
 
 def _system_message(messages: Sequence[Any]) -> Mapping[str, Any] | None:
@@ -120,20 +115,33 @@ def _system_message(messages: Sequence[Any]) -> Mapping[str, Any] | None:
 
 
 def _prefix_messages(messages: Sequence[Any]) -> list[Any]:
-    """Return the exact replay prefix before the newest conversational item."""
+    """Return the replay prefix before the newest conversational item."""
 
-    if len(messages) <= 1:
-        return list(messages)
-    return list(messages[:-1])
+    return list(messages if len(messages) <= 1 else messages[:-1])
+
+
+def _parsed_endpoint(base_url: str):
+    raw = str(base_url or "").strip()
+    if not raw:
+        return None
+    try:
+        return urlparse(raw if "://" in raw else f"http://{raw}")
+    except ValueError:
+        return None
 
 
 def _normalize_base_url(base_url: str) -> str:
-    value = str(base_url or "").strip().rstrip("/")
-    if not value:
+    parsed = _parsed_endpoint(base_url)
+    if parsed is None:
         return ""
-    parsed = urlparse(value if "://" in value else f"http://{value}")
-    host = (parsed.hostname or "").lower()
-    port = f":{parsed.port}" if parsed.port else ""
+    host = (parsed.hostname or "").lower().rstrip(".")
+    if not host:
+        return ""
+    try:
+        port_value = parsed.port
+    except ValueError:
+        return ""
+    port = f":{port_value}" if port_value else ""
     path = (parsed.path or "").rstrip("/")
     return f"{parsed.scheme or 'http'}://{host}{port}{path}"
 
@@ -160,24 +168,22 @@ def is_cache_eligible_endpoint(
     *,
     allow_remote: bool | None = None,
 ) -> bool:
-    """Return whether Hermes may disclose cache identifiers to this endpoint.
+    """Return whether cache identifiers may be disclosed to an endpoint.
 
-    Cache identifiers contain no prompt text, but they can correlate sessions.
-    Hermes therefore sends them only to loopback/private/tailnet endpoints by
-    default.  Operators can opt in for a trusted remote cache proxy with
-    ``HERMES_CACHE_ALLOW_REMOTE=1``.
+    ``provider`` is retained for API compatibility but is intentionally not a
+    trust signal. A public URL does not become private merely because its
+    configured provider name is ``lmstudio`` or ``ollama``.
     """
 
+    del provider
     if allow_remote is None:
         allow_remote = _truthy(os.getenv("HERMES_CACHE_ALLOW_REMOTE"))
     if allow_remote:
         return True
 
-    provider_name = str(provider or "").strip().lower()
-    if provider_name in {"lmstudio", "ollama"}:
-        return True
-
-    parsed = urlparse(base_url if "://" in str(base_url) else f"http://{base_url}")
+    parsed = _parsed_endpoint(base_url)
+    if parsed is None:
+        return False
     host = (parsed.hostname or "").strip().lower().rstrip(".")
     if not host:
         return False
@@ -187,11 +193,14 @@ def is_cache_eligible_endpoint(
         return True
     if host.endswith((".local", ".lan", ".internal", ".ts.net")):
         return True
+
     try:
         ip = ipaddress.ip_address(host)
     except ValueError:
         return False
-    return bool(ip.is_loopback or ip.is_private or ip.is_link_local or ip in ipaddress.ip_network("100.64.0.0/10"))
+    if ip.is_loopback or ip.is_private or ip.is_link_local:
+        return True
+    return isinstance(ip, ipaddress.IPv4Address) and ip in _TAILSCALE_NETWORK
 
 
 @dataclass(frozen=True)
@@ -228,39 +237,57 @@ def build_manifest(
     provider: str = "",
     api_mode: str = "",
     base_url: str = "",
+    stable_system_prefix: str = "",
 ) -> PromptCacheManifest:
-    """Build an exact, deterministic cache manifest from provider kwargs."""
+    """Build an exact, deterministic cache manifest from provider kwargs.
+
+    ``stable_system_prefix`` is an optional bridge for callers that know
+    Hermes' stable system tier before provider decoration. Without it, the
+    function uses a decorated static block when present and otherwise falls
+    back conservatively to the full system message.
+    """
 
     effective_model = str(request.get("model") or model or "")
     messages = _request_messages(request)
     system = _system_message(messages)
     system_content = system.get("content") if system else ""
     system_text = _content_text(system_content)
-    static_text = _decorated_static_prefix(system_content) or system_text
+    decorated_static = _decorated_static_prefix(system_content)
+    static_text = stable_system_prefix or decorated_static or system_text
     tools = request.get("tools") if isinstance(request.get("tools"), list) else []
     prefix_messages = _prefix_messages(messages)
 
     engine_id = classify_engine(provider, base_url)
-    model_fingerprint = os.getenv("HERMES_CACHE_MODEL_FINGERPRINT", "").strip() or effective_model
-    engine_fingerprint = os.getenv("HERMES_CACHE_ENGINE_FINGERPRINT", "").strip() or engine_id
-    chat_template_hash = os.getenv("HERMES_CACHE_CHAT_TEMPLATE_HASH", "").strip() or "unknown"
+    model_fingerprint = (
+        os.getenv("HERMES_CACHE_MODEL_FINGERPRINT", "").strip()
+        or effective_model
+    )
+    engine_fingerprint = (
+        os.getenv("HERMES_CACHE_ENGINE_FINGERPRINT", "").strip()
+        or engine_id
+    )
+    chat_template_hash = (
+        os.getenv("HERMES_CACHE_CHAT_TEMPLATE_HASH", "").strip()
+        or "unknown"
+    )
     kv_format = os.getenv("HERMES_CACHE_KV_FORMAT", "").strip() or "managed"
     endpoint = _normalize_base_url(base_url)
 
     static_hash = hash_text(static_text)
     system_hash = hash_text(system_text)
     tools_hash = hash_json(tools)
-    checkpoint_payload = {
-        "schema": CACHE_SCHEMA_VERSION,
-        "model_fingerprint": model_fingerprint,
-        "engine_fingerprint": engine_fingerprint,
-        "chat_template_hash": chat_template_hash,
-        "kv_format": kv_format,
-        "static_prefix_hash": static_hash,
-        "tool_schema_hash": tools_hash,
-        "api_mode": api_mode,
-    }
-    checkpoint_id = hash_json(checkpoint_payload)
+    checkpoint_id = hash_json(
+        {
+            "schema": CACHE_SCHEMA_VERSION,
+            "model_fingerprint": model_fingerprint,
+            "engine_fingerprint": engine_fingerprint,
+            "chat_template_hash": chat_template_hash,
+            "kv_format": kv_format,
+            "static_prefix_hash": static_hash,
+            "tool_schema_hash": tools_hash,
+            "api_mode": api_mode,
+        }
+    )
     request_prefix_id = hash_json(
         {
             "checkpoint_id": checkpoint_id,
@@ -268,6 +295,13 @@ def build_manifest(
             "tools": tools,
         }
     )
+
+    if stable_system_prefix:
+        source = "runtime-static"
+    elif decorated_static:
+        source = "decorated-static"
+    else:
+        source = "full-system"
 
     return PromptCacheManifest(
         schema_version=CACHE_SCHEMA_VERSION,
@@ -287,8 +321,10 @@ def build_manifest(
         endpoint=endpoint,
         session_id=str(session_id or ""),
         system_chars=len(system_text),
-        prefix_chars=len(_canonical_json(prefix_messages)) + len(_canonical_json(tools)),
-        source="decorated-static" if _decorated_static_prefix(system_content) else "full-system",
+        prefix_chars=(
+            len(_canonical_json(prefix_messages)) + len(_canonical_json(tools))
+        ),
+        source=source,
     )
 
 
@@ -305,7 +341,11 @@ def build_cache_headers(manifest: PromptCacheManifest) -> dict[str, str]:
     }
     if manifest.session_id:
         values["Session-Id"] = manifest.session_id
-    return {f"{_HEADER_PREFIX}{key}": value for key, value in values.items() if value}
+    return {
+        f"{_HEADER_PREFIX}{key}": value
+        for key, value in values.items()
+        if value
+    }
 
 
 @dataclass(frozen=True)
@@ -323,7 +363,7 @@ class CacheRouteCandidate:
 
 
 def route_score(candidate: CacheRouteCandidate) -> float:
-    """Lower is better; cache locality dominates small latency differences."""
+    """Return a lower-is-better cost where cache locality dominates latency."""
 
     if not candidate.healthy:
         return float("inf")
@@ -334,7 +374,9 @@ def route_score(candidate: CacheRouteCandidate) -> float:
         score += max(0.0, candidate.cold_load_ms) or 60_000.0
     if not candidate.checkpoint_present:
         tps = max(0.1, candidate.prefill_tokens_per_second)
-        score += max(0, candidate.estimated_prefix_tokens) / tps * 1_000.0
+        score += (
+            max(0, candidate.estimated_prefix_tokens) / tps * 1_000.0
+        )
     else:
         score -= 100_000.0
     if candidate.model_loaded:
@@ -344,18 +386,27 @@ def route_score(candidate: CacheRouteCandidate) -> float:
     return score
 
 
-def select_best_route(candidates: Iterable[CacheRouteCandidate]) -> CacheRouteCandidate | None:
+def select_best_route(
+    candidates: Iterable[CacheRouteCandidate],
+) -> CacheRouteCandidate | None:
     viable = [candidate for candidate in candidates if candidate.healthy]
     if not viable:
         return None
-    return min(viable, key=lambda candidate: (route_score(candidate), candidate.endpoint))
+    return min(
+        viable,
+        key=lambda candidate: (route_score(candidate), candidate.endpoint),
+    )
 
 
 class CacheStateStore:
-    """Small durable SQLite store for affinity, inventory, and cache telemetry."""
+    """Durable SQLite store for affinity, inventory, and cache telemetry."""
 
     def __init__(self, path: str | Path | None = None) -> None:
-        self.path = Path(path) if path else get_hermes_home() / "cache" / "state.db"
+        self.path = (
+            Path(path)
+            if path
+            else get_hermes_home() / "cache" / "state.db"
+        )
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._initialize()
 
@@ -415,7 +466,6 @@ class CacheStateStore:
     def bind_session(self, manifest: PromptCacheManifest) -> None:
         if not manifest.session_id or not manifest.endpoint:
             return
-        now = time.time()
         with _DB_LOCK, self._connect() as connection:
             connection.execute(
                 """
@@ -438,7 +488,7 @@ class CacheStateStore:
                     manifest.model,
                     manifest.checkpoint_id,
                     manifest.request_prefix_id,
-                    now,
+                    time.time(),
                 ),
             )
 
@@ -470,7 +520,10 @@ class CacheStateStore:
                     model=excluded.model,
                     engine_id=excluded.engine_id,
                     state=excluded.state,
-                    prefix_tokens=MAX(checkpoints.prefix_tokens, excluded.prefix_tokens),
+                    prefix_tokens=MAX(
+                        checkpoints.prefix_tokens,
+                        excluded.prefix_tokens
+                    ),
                     updated_at=excluded.updated_at
                 """,
                 (
@@ -565,10 +618,11 @@ class CacheStateStore:
         return payload
 
     def checkpoints(self, *, limit: int = 50) -> list[dict[str, Any]]:
+        bounded = max(1, min(int(limit), 500))
         with _DB_LOCK, self._connect() as connection:
             rows = connection.execute(
                 "SELECT * FROM checkpoints ORDER BY updated_at DESC LIMIT ?",
-                (max(1, min(int(limit), 500)),),
+                (bounded,),
             ).fetchall()
         return [dict(row) for row in rows]
 
