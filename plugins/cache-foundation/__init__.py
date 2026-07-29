@@ -1,8 +1,8 @@
 """Cache-aware inference foundation for Hermes.
 
 The plugin fingerprints exact provider requests, keeps session-to-endpoint
-an affinity, adds cache-routing headers to trusted local inference endpoints,
-and records cache telemetry around the real provider execution. It is
+affinity, adds cache-routing headers to trusted local inference endpoints, and
+records cache telemetry around the real provider execution. It is
 engine-neutral: a llama.cpp controller, LM Studio, Ollama, or a fleet proxy can
 consume the identifiers without changing Hermes' planner or transports.
 """
@@ -10,6 +10,7 @@ consume the identifiers without changing Hermes' planner or transports.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import sys
@@ -35,6 +36,10 @@ _STORE: Optional[CacheStateStore] = None
 _STORE_LOCK = threading.RLock()
 _PENDING: dict[str, PromptCacheManifest] = {}
 _PENDING_LOCK = threading.RLock()
+_PENDING_LIMIT = 1024
+_STABLE_PREFIX_CACHE: tuple[str, int, int, str] | None = None
+_STABLE_PREFIX_LOCK = threading.RLock()
+_STABLE_PREFIX_MAX_BYTES = 4 * 1024 * 1024
 _TRUE_VALUES = {"1", "true", "yes", "on"}
 
 
@@ -47,13 +52,7 @@ def _disabled() -> bool:
 
 
 def _eligible_endpoint(endpoint: str) -> bool:
-    """Apply endpoint policy without trusting provider branding.
-
-    A remote URL does not become safe merely because its configured provider
-    name is ``lmstudio`` or ``ollama``. The host itself must be loopback,
-    private, link-local, LAN, or Tailscale unless the operator explicitly opts
-    in with ``HERMES_CACHE_ALLOW_REMOTE=1``.
-    """
+    """Apply endpoint policy without trusting provider branding."""
 
     return is_cache_eligible_endpoint(endpoint, provider="")
 
@@ -68,11 +67,97 @@ def _store() -> CacheStateStore:
 
 
 def _reset_store_for_tests() -> None:
-    global _STORE
+    global _STORE, _STABLE_PREFIX_CACHE
     with _STORE_LOCK:
         _STORE = None
     with _PENDING_LOCK:
         _PENDING.clear()
+    with _STABLE_PREFIX_LOCK:
+        _STABLE_PREFIX_CACHE = None
+
+
+def _request_system_text(request: Mapping[str, Any]) -> str:
+    messages = request.get("messages")
+    if not isinstance(messages, list):
+        messages = request.get("input")
+    if not isinstance(messages, list):
+        return ""
+
+    for message in messages:
+        if not isinstance(message, Mapping):
+            continue
+        if str(message.get("role") or "").lower() not in {"system", "developer"}:
+            continue
+        content = message.get("content")
+        if isinstance(content, str):
+            return content
+        if not isinstance(content, list):
+            return ""
+        parts: list[str] = []
+        for part in content:
+            if isinstance(part, str):
+                parts.append(part)
+            elif isinstance(part, Mapping):
+                text = part.get("text")
+                if isinstance(text, str):
+                    parts.append(text)
+                elif isinstance(part.get("content"), str):
+                    parts.append(str(part["content"]))
+        return "".join(parts)
+    return ""
+
+
+def _stable_prefix_file() -> Path | None:
+    configured = os.getenv("HERMES_CACHE_STABLE_PREFIX_FILE", "").strip()
+    return Path(configured).expanduser() if configured else None
+
+
+def _load_stable_prefix() -> str:
+    """Load an operator-owned exact prefix without persisting its contents."""
+
+    global _STABLE_PREFIX_CACHE
+    path = _stable_prefix_file()
+    if path is None:
+        return ""
+    try:
+        stat = path.stat()
+    except OSError:
+        return ""
+    if not path.is_file() or stat.st_size <= 0 or stat.st_size > _STABLE_PREFIX_MAX_BYTES:
+        return ""
+
+    cache_key = (str(path.resolve()), stat.st_mtime_ns, stat.st_size)
+    with _STABLE_PREFIX_LOCK:
+        if _STABLE_PREFIX_CACHE is not None and _STABLE_PREFIX_CACHE[:3] == cache_key:
+            return _STABLE_PREFIX_CACHE[3]
+        try:
+            prefix = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            return ""
+        if not prefix:
+            return ""
+        _STABLE_PREFIX_CACHE = (*cache_key, prefix)
+        return prefix
+
+
+def _stable_prefix_for_request(request: Mapping[str, Any]) -> str:
+    prefix = _load_stable_prefix()
+    if not prefix:
+        return ""
+    system_text = _request_system_text(request)
+    return prefix if system_text.startswith(prefix) else ""
+
+
+def _stable_prefix_status() -> dict[str, Any]:
+    path = _stable_prefix_file()
+    prefix = _load_stable_prefix()
+    return {
+        "configured": path is not None,
+        "path": str(path) if path else "",
+        "loaded": bool(prefix),
+        "chars": len(prefix),
+        "sha256": hashlib.sha256(prefix.encode("utf-8")).hexdigest() if prefix else "",
+    }
 
 
 def _build_manifest_from_kwargs(kwargs: Mapping[str, Any]) -> PromptCacheManifest:
@@ -86,11 +171,21 @@ def _build_manifest_from_kwargs(kwargs: Mapping[str, Any]) -> PromptCacheManifes
         provider=str(kwargs.get("provider") or ""),
         api_mode=str(kwargs.get("api_mode") or ""),
         base_url=str(kwargs.get("base_url") or ""),
+        stable_system_prefix=_stable_prefix_for_request(request),
     )
 
 
+def _remember_pending(request_id: str, manifest: PromptCacheManifest) -> None:
+    if not request_id:
+        return
+    with _PENDING_LOCK:
+        _PENDING[request_id] = manifest
+        while len(_PENDING) > _PENDING_LIMIT:
+            _PENDING.pop(next(iter(_PENDING)))
+
+
 def _cache_request(**kwargs: Any) -> dict[str, Any] | None:
-    """Attach cache identifiers without changing provider semantics."""
+    """Attach authoritative cache identifiers without changing semantics."""
 
     if _disabled():
         return None
@@ -107,8 +202,9 @@ def _cache_request(**kwargs: Any) -> dict[str, Any] | None:
     manifest = _build_manifest_from_kwargs(kwargs)
     updated = dict(request)
     headers = dict(updated.get("extra_headers") or {})
-    for key, value in build_cache_headers(manifest).items():
-        headers.setdefault(key, value)
+    # Hermes owns this namespace. Overwrite forged/stale cache headers while
+    # preserving all unrelated provider headers.
+    headers.update(build_cache_headers(manifest))
     updated["extra_headers"] = headers
 
     try:
@@ -118,11 +214,7 @@ def _cache_request(**kwargs: Any) -> dict[str, Any] | None:
     except Exception as exc:
         print(f"cache-foundation: state write failed: {exc}", file=sys.stderr)
 
-    request_id = str(kwargs.get("api_request_id") or "")
-    if request_id:
-        with _PENDING_LOCK:
-            _PENDING[request_id] = manifest
-
+    _remember_pending(str(kwargs.get("api_request_id") or ""), manifest)
     return {
         "request": updated,
         "source": "cache-foundation",
@@ -169,10 +261,7 @@ def _usage_metrics(response: Any) -> dict[str, int]:
 
     details = _read_attr(usage, "prompt_tokens_details", None)
     if details is not None:
-        cache_read = max(
-            cache_read,
-            int(_read_attr(details, "cached_tokens", 0) or 0),
-        )
+        cache_read = max(cache_read, int(_read_attr(details, "cached_tokens", 0) or 0))
     input_details = _read_attr(usage, "input_tokens_details", None)
     if input_details is not None:
         cache_read = max(
@@ -261,11 +350,7 @@ def _setup_cli(parser: argparse.ArgumentParser) -> None:
         "status",
         help="Show cache-affinity and telemetry status",
     )
-    status.add_argument(
-        "--json",
-        action="store_true",
-        help="Emit machine-readable JSON",
-    )
+    status.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
 
     inspect = commands.add_parser("inspect", help="Inspect recent cache requests")
     inspect.add_argument("--session", default="", help="Filter by Hermes session ID")
@@ -314,18 +399,17 @@ def _cmd_status(as_json: bool) -> int:
     summary.update(
         {
             "enabled": not _disabled(),
-            "remote_headers_allowed": _truthy(
-                os.getenv("HERMES_CACHE_ALLOW_REMOTE")
-            ),
+            "remote_headers_allowed": _truthy(os.getenv("HERMES_CACHE_ALLOW_REMOTE")),
             "mode": os.getenv("HERMES_CACHE_MODE", "prefer"),
             "engine_override": os.getenv("HERMES_CACHE_ENGINE_ID", ""),
             "model_fingerprint_override": os.getenv(
                 "HERMES_CACHE_MODEL_FINGERPRINT", ""
             ),
-            "chat_template_hash": os.getenv(
-                "HERMES_CACHE_CHAT_TEMPLATE_HASH", ""
-            ),
+            "chat_template_hash": os.getenv("HERMES_CACHE_CHAT_TEMPLATE_HASH", ""),
             "kv_format": os.getenv("HERMES_CACHE_KV_FORMAT", "managed"),
+            "stable_prefix": _stable_prefix_status(),
+            "pending_requests": len(_PENDING),
+            "pending_limit": _PENDING_LIMIT,
         }
     )
     if as_json:
@@ -368,10 +452,7 @@ def _cmd_clear(session_id: str, checkpoints: bool) -> int:
 def _probe_json(url: str, timeout: float) -> tuple[int, Any]:
     request = urllib.request.Request(url, headers={"Accept": "application/json"})
     try:
-        with urllib.request.urlopen(
-            request,
-            timeout=max(0.1, timeout),
-        ) as response:
+        with urllib.request.urlopen(request, timeout=max(0.1, timeout)) as response:
             raw = response.read().decode("utf-8", errors="replace")
             return int(response.status), json.loads(raw) if raw else None
     except urllib.error.HTTPError as exc:
@@ -390,6 +471,7 @@ def _cmd_doctor(endpoint: str, provider: str, timeout: float) -> int:
         "provider": provider,
         "engine": engine,
         "control_mode": "explicit" if engine == "llama.cpp" else "managed",
+        "stable_prefix": _stable_prefix_status(),
     }
     if endpoint:
         base = endpoint.rstrip("/")
@@ -445,11 +527,9 @@ def _cmd_warm(endpoint: str, model: str, prompt_file: str, timeout: float) -> in
         provider="custom",
         api_mode="chat_completions",
         base_url=endpoint,
+        stable_system_prefix=prompt,
     )
-    headers = {
-        "Content-Type": "application/json",
-        **build_cache_headers(manifest),
-    }
+    headers = {"Content-Type": "application/json", **build_cache_headers(manifest)}
     api_key = os.getenv("HERMES_CACHE_API_KEY", "").strip()
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
