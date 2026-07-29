@@ -28,12 +28,9 @@ def test_hash_json_sorts_mapping_keys_but_preserves_list_order():
     assert hash_json(["a", "b"]) != hash_json(["b", "a"])
 
 
-def test_checkpoint_is_session_independent_but_request_prefix_is_not():
-    request_one = _request("stable system", user="first")
-    request_two = _request("stable system", user="second")
-
+def test_checkpoint_and_prior_prefix_ignore_newest_user_item():
     first = build_manifest(
-        request_one,
+        _request("stable system", user="first"),
         session_id="session-a",
         model="local/qwen",
         provider="lmstudio",
@@ -41,7 +38,7 @@ def test_checkpoint_is_session_independent_but_request_prefix_is_not():
         base_url="http://127.0.0.1:1234/v1",
     )
     second = build_manifest(
-        request_two,
+        _request("stable system", user="second"),
         session_id="session-b",
         model="local/qwen",
         provider="lmstudio",
@@ -50,7 +47,6 @@ def test_checkpoint_is_session_independent_but_request_prefix_is_not():
     )
 
     assert first.checkpoint_id == second.checkpoint_id
-    # The newest item is intentionally outside the replay-prefix hash.
     assert first.request_prefix_id == second.request_prefix_id
     assert first.session_id != second.session_id
 
@@ -108,6 +104,30 @@ def test_decorated_static_prefix_excludes_volatile_system_suffix():
     assert first.checkpoint_id == second.checkpoint_id
 
 
+def test_runtime_static_prefix_override_supports_local_plain_system_messages():
+    first = build_manifest(
+        _request("stable prefix\n\nworkspace A\n\nsession A"),
+        stable_system_prefix="stable prefix",
+        model="model",
+        provider="custom",
+        api_mode="chat_completions",
+        base_url="http://x1-370:8080/v1",
+    )
+    second = build_manifest(
+        _request("stable prefix\n\nworkspace B\n\nsession B"),
+        stable_system_prefix="stable prefix",
+        model="model",
+        provider="custom",
+        api_mode="chat_completions",
+        base_url="http://x1-370:8080/v1",
+    )
+
+    assert first.source == "runtime-static"
+    assert first.static_prefix_hash == second.static_prefix_hash
+    assert first.system_hash != second.system_hash
+    assert first.checkpoint_id == second.checkpoint_id
+
+
 def test_headers_contain_identifiers_not_prompt_text():
     manifest = build_manifest(
         _request("TOP SECRET PROMPT"),
@@ -125,7 +145,7 @@ def test_headers_contain_identifiers_not_prompt_text():
     assert headers["X-Hermes-Cache-Session-Id"] == "session-1"
 
 
-def test_endpoint_eligibility_is_private_by_default(monkeypatch):
+def test_endpoint_eligibility_is_host_based_and_private_by_default(monkeypatch):
     monkeypatch.delenv("HERMES_CACHE_ALLOW_REMOTE", raising=False)
 
     assert is_cache_eligible_endpoint("http://localhost:8080/v1")
@@ -133,6 +153,10 @@ def test_endpoint_eligibility_is_private_by_default(monkeypatch):
     assert is_cache_eligible_endpoint("http://x1-370.lan:8080/v1")
     assert is_cache_eligible_endpoint("http://x1-370.kipnerter.ts.net:8080/v1")
     assert not is_cache_eligible_endpoint("https://api.example.com/v1")
+    assert not is_cache_eligible_endpoint(
+        "https://api.example.com/v1",
+        provider="lmstudio",
+    )
 
 
 def test_route_scoring_prefers_affinity_over_small_latency_difference():
@@ -145,7 +169,6 @@ def test_route_scoring_prefers_affinity_over_small_latency_difference():
     )
     cold = CacheRouteCandidate(
         endpoint="http://fast:8080",
-        session_affinity=False,
         checkpoint_present=False,
         model_loaded=True,
         prefill_tokens_per_second=100,
