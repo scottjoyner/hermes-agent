@@ -1,0 +1,6 @@
+name: cache-foundation
+version: 0.1.0
+description: Cache-aware inference manifests, local endpoint affinity, warmup, and telemetry
+author: Scott Joyner
+license: MIT
+hermes_version: ">=0.19.0,<1"
