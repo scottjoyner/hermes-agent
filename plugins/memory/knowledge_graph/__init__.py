@@ -1,9 +1,8 @@
 """Neo4j knowledge-graph memory provider for Hermes Agent.
 
-The provider is deliberately isolated from Hermes core. It consumes the public
-MemoryProvider lifecycle, stores completed turns through ``sync_turn(...,
-messages=...)``, and keeps network writes off the conversation path with a
-durable SQLite queue.
+The plugin uses only the public MemoryProvider lifecycle. Completed turns arrive
+through ``sync_turn(..., messages=...)`` and are written by a durable background
+queue, so Neo4j and embedding latency never block the conversation path.
 """
 
 from __future__ import annotations
@@ -13,18 +12,18 @@ import importlib.util
 import json
 import logging
 import os
-import queue
 import re
-import sqlite3
 import threading
-import time
 import urllib.error
 import urllib.request
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
 from agent.memory_provider import MemoryProvider
+
+from .queue_store import DurableQueue as _DurableQueue
 
 logger = logging.getLogger(__name__)
 
@@ -48,7 +47,9 @@ def _utc_now() -> str:
 
 
 def _hash(value: str) -> str:
-    return hashlib.sha256(value.encode("utf-8", errors="replace")).hexdigest()[:16]
+    return hashlib.sha256(
+        value.encode("utf-8", errors="replace")
+    ).hexdigest()[:16]
 
 
 def _message_text(message: Dict[str, Any]) -> str:
@@ -74,130 +75,6 @@ def _json_result(payload: Any) -> str:
     return json.dumps(payload, ensure_ascii=False, default=str)
 
 
-class _DurableQueue:
-    """SQLite-backed write-behind queue.
-
-    Rows are deleted only after the Neo4j callback succeeds. Failed rows remain
-    durable and are retried with bounded exponential backoff.
-    """
-
-    _STOP = object()
-
-    def __init__(self, path: Path, callback) -> None:
-        self.path = path
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.callback = callback
-        self._work: "queue.Queue[Any]" = queue.Queue()
-        self._stopping = threading.Event()
-        self._init_db()
-        self._thread = threading.Thread(
-            target=self._run,
-            name="hermes-kg-writer",
-            daemon=True,
-        )
-        self._thread.start()
-        for row_id in self._pending_ids():
-            self._work.put(row_id)
-
-    def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(str(self.path), timeout=30)
-        conn.row_factory = sqlite3.Row
-        return conn
-
-    def _init_db(self) -> None:
-        with self._connect() as conn:
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS pending (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    payload TEXT NOT NULL,
-                    attempts INTEGER NOT NULL DEFAULT 0,
-                    created_at REAL NOT NULL
-                )
-                """
-            )
-
-    def _pending_ids(self) -> List[int]:
-        with self._connect() as conn:
-            return [
-                int(row["id"])
-                for row in conn.execute("SELECT id FROM pending ORDER BY id")
-            ]
-
-    def enqueue(self, payload: Dict[str, Any]) -> int:
-        with self._connect() as conn:
-            cursor = conn.execute(
-                "INSERT INTO pending(payload, created_at) VALUES (?, ?)",
-                (json.dumps(payload, ensure_ascii=False), time.time()),
-            )
-            row_id = int(cursor.lastrowid)
-        self._work.put(row_id)
-        return row_id
-
-    def _load(self, row_id: int) -> Optional[tuple[Dict[str, Any], int]]:
-        with self._connect() as conn:
-            row = conn.execute(
-                "SELECT payload, attempts FROM pending WHERE id = ?",
-                (row_id,),
-            ).fetchone()
-        if not row:
-            return None
-        return json.loads(row["payload"]), int(row["attempts"])
-
-    def _success(self, row_id: int) -> None:
-        with self._connect() as conn:
-            conn.execute("DELETE FROM pending WHERE id = ?", (row_id,))
-
-    def _failure(self, row_id: int) -> int:
-        with self._connect() as conn:
-            conn.execute(
-                "UPDATE pending SET attempts = attempts + 1 WHERE id = ?",
-                (row_id,),
-            )
-            row = conn.execute(
-                "SELECT attempts FROM pending WHERE id = ?",
-                (row_id,),
-            ).fetchone()
-        return int(row["attempts"]) if row else 0
-
-    def _run(self) -> None:
-        while not self._stopping.is_set():
-            item = self._work.get()
-            if item is self._STOP:
-                break
-            loaded = self._load(int(item))
-            if not loaded:
-                continue
-            payload, _attempts = loaded
-            try:
-                self.callback(payload)
-            except Exception as exc:
-                attempts = self._failure(int(item))
-                logger.warning(
-                    "Knowledge graph write failed (attempt %s): %s",
-                    attempts,
-                    exc,
-                )
-                delay = min(30.0, max(1.0, 2.0 ** min(attempts, 5)))
-                if not self._stopping.wait(delay):
-                    self._work.put(item)
-            else:
-                self._success(int(item))
-
-    def pending_count(self) -> int:
-        with self._connect() as conn:
-            row = conn.execute("SELECT COUNT(*) AS n FROM pending").fetchone()
-        return int(row["n"])
-
-    def close(self, timeout: float = 10.0) -> None:
-        deadline = time.time() + max(0.0, timeout)
-        while self.pending_count() and time.time() < deadline:
-            time.sleep(0.1)
-        self._stopping.set()
-        self._work.put(self._STOP)
-        self._thread.join(timeout=2.0)
-
-
 class KnowledgeGraphMemoryProvider(MemoryProvider):
     """Persistent session, delegation, idea, and document graph in Neo4j."""
 
@@ -219,8 +96,7 @@ class KnowledgeGraphMemoryProvider(MemoryProvider):
         return "knowledge_graph"
 
     def _config_path(self, hermes_home: Optional[Path] = None) -> Path:
-        home = hermes_home or self._hermes_home
-        return Path(home) / "knowledge_graph.json"
+        return Path(hermes_home or self._hermes_home) / "knowledge_graph.json"
 
     def _load_config(self) -> Dict[str, Any]:
         defaults: Dict[str, Any] = {
@@ -231,6 +107,7 @@ class KnowledgeGraphMemoryProvider(MemoryProvider):
             "database": "neo4j",
             "capture_reasoning": False,
             "capture_tool_arguments": False,
+            "capture_tool_results": False,
             "prefetch_top_k": 6,
             "prefetch_max_chars": 1800,
             "embeddings_base_urls": [],
@@ -242,7 +119,11 @@ class KnowledgeGraphMemoryProvider(MemoryProvider):
         try:
             from hermes_cli.config import cfg_get, load_config
 
-            section = cfg_get(load_config(), "knowledge_graph") or {}
+            section = cfg_get(
+                load_config(),
+                "knowledge_graph",
+                default={},
+            ) or {}
         except Exception:
             section = {}
         try:
@@ -260,7 +141,8 @@ class KnowledgeGraphMemoryProvider(MemoryProvider):
         cfg = {**defaults, **section}
         cfg["enabled"] = bool(
             cfg.get("enabled")
-            or os.getenv("HERMES_KG_ENABLED", "").lower() in {"1", "true", "yes"}
+            or os.getenv("HERMES_KG_ENABLED", "").lower()
+            in {"1", "true", "yes"}
         )
         cfg["uri"] = os.getenv("NEO4J_URI", "") or str(
             cfg.get("uri") or defaults["uri"]
@@ -277,12 +159,17 @@ class KnowledgeGraphMemoryProvider(MemoryProvider):
         env_urls = os.getenv("HERMES_KG_EMBEDDINGS_URLS", "")
         if env_urls:
             cfg["embeddings_base_urls"] = [
-                url.strip() for url in env_urls.split(",") if url.strip()
+                url.strip()
+                for url in env_urls.split(",")
+                if url.strip()
             ]
-        elif isinstance(cfg.get("embeddings_base_url"), str) and cfg.get(
-            "embeddings_base_url"
-        ):
-            cfg["embeddings_base_urls"] = [cfg["embeddings_base_url"]]
+        elif isinstance(
+            cfg.get("embeddings_base_url"),
+            str,
+        ) and cfg.get("embeddings_base_url"):
+            cfg["embeddings_base_urls"] = [
+                cfg["embeddings_base_url"]
+            ]
         cfg["embeddings_model"] = os.getenv(
             "HERMES_KG_EMBEDDINGS_MODEL",
             "",
@@ -306,11 +193,14 @@ class KnowledgeGraphMemoryProvider(MemoryProvider):
             {
                 "key": "enabled",
                 "description": "Enable the Neo4j knowledge graph provider",
-                "default": True,
+                "default": "true",
+                "choices": ["true", "false"],
             },
             {
                 "key": "uri",
-                "description": "Neo4j URI, for example bolt://localhost:7687",
+                "description": (
+                    "Neo4j URI, for example bolt://localhost:7687"
+                ),
                 "default": "bolt://localhost:7687",
             },
             {
@@ -331,28 +221,76 @@ class KnowledgeGraphMemoryProvider(MemoryProvider):
             },
             {
                 "key": "embeddings_base_urls",
-                "description": "Comma-separated OpenAI-compatible embedding endpoints",
+                "description": (
+                    "Comma-separated OpenAI-compatible embedding endpoints"
+                ),
                 "default": "",
             },
             {
                 "key": "embeddings_model",
-                "description": "Embedding model exposed by the local endpoint",
+                "description": (
+                    "Embedding model exposed by the local endpoint"
+                ),
                 "default": "",
             },
             {
                 "key": "capture_reasoning",
-                "description": "Store model reasoning fields (privacy-sensitive)",
-                "default": False,
+                "description": (
+                    "Store model reasoning fields (privacy-sensitive)"
+                ),
+                "default": "false",
+                "choices": ["true", "false"],
+            },
+            {
+                "key": "capture_tool_arguments",
+                "description": (
+                    "Store raw tool arguments (privacy-sensitive)"
+                ),
+                "default": "false",
+                "choices": ["true", "false"],
+            },
+            {
+                "key": "capture_tool_results",
+                "description": (
+                    "Store raw tool results (privacy-sensitive)"
+                ),
+                "default": "false",
+                "choices": ["true", "false"],
             },
         ]
 
-    def save_config(self, values: Dict[str, Any], hermes_home: str) -> None:
+    @staticmethod
+    def _as_bool(value: Any) -> bool:
+        if isinstance(value, bool):
+            return value
+        return str(value).strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+
+    def save_config(
+        self,
+        values: Dict[str, Any],
+        hermes_home: str,
+    ) -> None:
         cleaned = dict(values)
         urls = cleaned.get("embeddings_base_urls")
         if isinstance(urls, str):
             cleaned["embeddings_base_urls"] = [
-                url.strip() for url in urls.split(",") if url.strip()
+                url.strip()
+                for url in urls.split(",")
+                if url.strip()
             ]
+        for key in (
+            "enabled",
+            "capture_reasoning",
+            "capture_tool_arguments",
+            "capture_tool_results",
+        ):
+            if key in cleaned:
+                cleaned[key] = self._as_bool(cleaned[key])
         path = self._config_path(Path(hermes_home))
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(
@@ -375,7 +313,10 @@ class KnowledgeGraphMemoryProvider(MemoryProvider):
 
             self._driver = GraphDatabase.driver(
                 self._cfg["uri"],
-                auth=(self._cfg["user"], self._cfg["password"]),
+                auth=(
+                    self._cfg["user"],
+                    self._cfg["password"],
+                ),
             )
             self._driver.verify_connectivity()
             self._ensure_schema()
@@ -388,7 +329,11 @@ class KnowledgeGraphMemoryProvider(MemoryProvider):
             self._available = False
             return
         self._available = True
-        queue_path = self._hermes_home / "knowledge_graph" / "pending.db"
+        queue_path = (
+            self._hermes_home
+            / "knowledge_graph"
+            / "pending.db"
+        )
         self._queue = _DurableQueue(queue_path, self._apply_job)
         if self._session_id:
             self._enqueue_session(self._session_id, event="start")
@@ -402,9 +347,13 @@ class KnowledgeGraphMemoryProvider(MemoryProvider):
 
     def _ensure_schema(self) -> None:
         statements = [
-            "CREATE CONSTRAINT kg_node_id IF NOT EXISTS FOR (n:KgNode) REQUIRE n.id IS UNIQUE",
             (
-                "CREATE FULLTEXT INDEX kg_text IF NOT EXISTS FOR (n:KgNode) "
+                "CREATE CONSTRAINT kg_node_id IF NOT EXISTS "
+                "FOR (n:KgNode) REQUIRE n.id IS UNIQUE"
+            ),
+            (
+                "CREATE FULLTEXT INDEX kg_text IF NOT EXISTS "
+                "FOR (n:KgNode) "
                 "ON EACH [n.content, n.title, n.path, n.tags]"
             ),
         ]
@@ -424,8 +373,9 @@ class KnowledgeGraphMemoryProvider(MemoryProvider):
         statement = (
             "CREATE VECTOR INDEX kg_embedding IF NOT EXISTS "
             "FOR (n:KgNode) ON (n.embedding) "
-            f"OPTIONS {{indexConfig: {{`vector.dimensions`: {int(dimensions)}, "
-            "`vector.similarity_function`: 'cosine'}}}"
+            f"OPTIONS {{indexConfig: {{`vector.dimensions`: "
+            f"{int(dimensions)}, "
+            "`vector.similarity_function`: 'cosine'}}"
         )
         try:
             with self._session() as session:
@@ -433,7 +383,8 @@ class KnowledgeGraphMemoryProvider(MemoryProvider):
             self._vector_dimensions = dimensions
         except Exception as exc:
             logger.debug(
-                "Neo4j vector index unavailable; full-text fallback remains active: %s",
+                "Neo4j vector index unavailable; "
+                "full-text fallback remains active: %s",
                 exc,
             )
 
@@ -443,14 +394,19 @@ class KnowledgeGraphMemoryProvider(MemoryProvider):
         if not urls or not model or not text.strip():
             return None
         payload = json.dumps(
-            {"model": model, "input": text[:12000]}
+            {
+                "model": model,
+                "input": text[:12000],
+            }
         ).encode("utf-8")
         for base in urls:
             endpoint = str(base).rstrip("/")
             if not endpoint.endswith("/embeddings"):
                 endpoint += "/embeddings"
             headers = {"Content-Type": "application/json"}
-            api_key = str(self._cfg.get("embeddings_api_key") or "")
+            api_key = str(
+                self._cfg.get("embeddings_api_key") or ""
+            )
             if api_key:
                 headers["Authorization"] = f"Bearer {api_key}"
             request = urllib.request.Request(
@@ -463,10 +419,13 @@ class KnowledgeGraphMemoryProvider(MemoryProvider):
                 with urllib.request.urlopen(
                     request,
                     timeout=float(
-                        self._cfg.get("embedding_timeout") or 15.0
+                        self._cfg.get("embedding_timeout")
+                        or 15.0
                     ),
                 ) as response:
-                    body = json.loads(response.read().decode("utf-8"))
+                    body = json.loads(
+                        response.read().decode("utf-8")
+                    )
                 vector = body["data"][0]["embedding"]
                 if isinstance(vector, list) and vector:
                     result = [float(value) for value in vector]
@@ -521,7 +480,9 @@ class KnowledgeGraphMemoryProvider(MemoryProvider):
                 {
                     "id": f"session:{parent_session_id}",
                     "kind": "session",
-                    "props": {"session_id": parent_session_id},
+                    "props": {
+                        "session_id": parent_session_id,
+                    },
                 }
             )
             relationships.append(
@@ -543,7 +504,13 @@ class KnowledgeGraphMemoryProvider(MemoryProvider):
         self,
         messages: List[Dict[str, Any]],
         session_id: str,
-    ) -> tuple[List[Dict[str, Any]], List[Dict[str, str]]]:
+        *,
+        turn_token: str = "",
+    ) -> tuple[
+        List[Dict[str, Any]],
+        List[Dict[str, str]],
+    ]:
+        token = turn_token or uuid.uuid4().hex
         start = 0
         for index in range(len(messages) - 1, -1, -1):
             if messages[index].get("role") == "user":
@@ -560,18 +527,31 @@ class KnowledgeGraphMemoryProvider(MemoryProvider):
             if role not in {"user", "assistant", "tool"}:
                 continue
             content = _message_text(message)
+            if role == "tool" and not self._as_bool(
+                self._cfg.get("capture_tool_results")
+            ):
+                content = (
+                    "[tool result omitted; "
+                    "enable capture_tool_results to store]"
+                )
             node_id = (
-                f"message:{session_id}:{offset}:{_hash(role + content)}"
+                f"message:{session_id}:{token}:{offset}:"
+                f"{_hash(role + content)}"
             )
             props: Dict[str, Any] = {
                 "session_id": session_id,
                 "role": role,
                 "content": content[:50000],
                 "sequence": offset,
+                "turn_token": token,
                 "created_at": _utc_now(),
             }
             nodes.append(
-                {"id": node_id, "kind": "message", "props": props}
+                {
+                    "id": node_id,
+                    "kind": "message",
+                    "props": props,
+                }
             )
             relationships.append(
                 {
@@ -596,20 +576,23 @@ class KnowledgeGraphMemoryProvider(MemoryProvider):
                     or message.get("reasoning_content")
                     or ""
                 )
-                if self._cfg.get("capture_reasoning") and reasoning.strip():
+                if self._as_bool(
+                    self._cfg.get("capture_reasoning")
+                ) and reasoning.strip():
                     reasoning_id = (
-                        f"reasoning:{session_id}:{offset}:{_hash(reasoning)}"
+                        f"reasoning:{session_id}:{token}:{offset}:"
+                        f"{_hash(reasoning)}"
                     )
-                    reasoning_props: Dict[str, Any] = {
-                        "session_id": session_id,
-                        "content": reasoning[:50000],
-                        "created_at": _utc_now(),
-                    }
                     nodes.append(
                         {
                             "id": reasoning_id,
                             "kind": "reasoning",
-                            "props": reasoning_props,
+                            "props": {
+                                "session_id": session_id,
+                                "content": reasoning[:50000],
+                                "turn_token": token,
+                                "created_at": _utc_now(),
+                            },
                         }
                     )
                     relationships.append(
@@ -623,17 +606,27 @@ class KnowledgeGraphMemoryProvider(MemoryProvider):
                     function = call.get("function") or {}
                     call_id = str(
                         call.get("id")
-                        or _hash(json.dumps(call, default=str))
+                        or _hash(
+                            json.dumps(call, default=str)
+                        )
                     )
-                    tool_name = str(function.get("name") or "unknown")
-                    if self._cfg.get("capture_tool_arguments"):
-                        arguments = str(function.get("arguments") or "")
+                    tool_name = str(
+                        function.get("name") or "unknown"
+                    )
+                    if self._as_bool(
+                        self._cfg.get("capture_tool_arguments")
+                    ):
+                        arguments = str(
+                            function.get("arguments") or ""
+                        )
                     else:
                         arguments = (
-                            "[redacted; enable capture_tool_arguments to store]"
+                            "[redacted; enable "
+                            "capture_tool_arguments to store]"
                         )
                     tool_node_id = (
-                        f"tool:{session_id}:{offset}:{_hash(call_id)}"
+                        f"tool:{session_id}:{token}:{offset}:"
+                        f"{_hash(call_id)}"
                     )
                     tool_call_nodes[call_id] = tool_node_id
                     nodes.append(
@@ -644,6 +637,7 @@ class KnowledgeGraphMemoryProvider(MemoryProvider):
                                 "session_id": session_id,
                                 "name": tool_name,
                                 "arguments": arguments[:50000],
+                                "turn_token": token,
                                 "created_at": _utc_now(),
                             },
                         }
@@ -656,7 +650,9 @@ class KnowledgeGraphMemoryProvider(MemoryProvider):
                         }
                     )
             elif role == "tool":
-                call_id = str(message.get("tool_call_id") or "")
+                call_id = str(
+                    message.get("tool_call_id") or ""
+                )
                 if call_id and call_id in tool_call_nodes:
                     relationships.append(
                         {
@@ -681,12 +677,19 @@ class KnowledgeGraphMemoryProvider(MemoryProvider):
         if not active_session:
             return
         payload_messages = messages or [
-            {"role": "user", "content": user_content},
-            {"role": "assistant", "content": assistant_content},
+            {
+                "role": "user",
+                "content": user_content,
+            },
+            {
+                "role": "assistant",
+                "content": assistant_content,
+            },
         ]
         nodes, relationships = self._nodes_from_messages(
             payload_messages,
             active_session,
+            turn_token=uuid.uuid4().hex,
         )
         if nodes:
             self._enqueue_session(active_session, event="turn")
@@ -713,7 +716,11 @@ class KnowledgeGraphMemoryProvider(MemoryProvider):
                 new_session_id,
                 parent_session_id=(
                     parent_session_id
-                    or (old_session_id if not reset else "")
+                    or (
+                        old_session_id
+                        if not reset
+                        else ""
+                    )
                 ),
                 event=str(
                     kwargs.get("reason")
@@ -722,7 +729,10 @@ class KnowledgeGraphMemoryProvider(MemoryProvider):
                 ),
             )
 
-    def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
+    def on_session_end(
+        self,
+        messages: List[Dict[str, Any]],
+    ) -> None:
         if self._available and self._session_id:
             self._enqueue_session(
                 self._session_id,
@@ -744,7 +754,10 @@ class KnowledgeGraphMemoryProvider(MemoryProvider):
             f"delegation:{self._session_id}:"
             f"{_hash(task + child_session_id)}"
         )
-        child_id = child_session_id or f"external:{_hash(task)}"
+        child_id = (
+            child_session_id
+            or f"external:{_hash(task)}"
+        )
         nodes = [
             {
                 "id": delegation_id,
@@ -788,14 +801,17 @@ class KnowledgeGraphMemoryProvider(MemoryProvider):
     def _apply_job(self, payload: Dict[str, Any]) -> None:
         if payload.get("type") != "upsert":
             raise ValueError(
-                f"Unsupported knowledge graph job: {payload.get('type')}"
+                "Unsupported knowledge graph job: "
+                f"{payload.get('type')}"
             )
         nodes = payload.get("nodes") or []
         relationships = payload.get("relationships") or []
         for node in nodes:
             props = node.get("props") or {}
             content = str(
-                props.get("content") or props.get("result") or ""
+                props.get("content")
+                or props.get("result")
+                or ""
             )
             if content and "embedding" not in props:
                 embedding = self._embed(content)
@@ -813,15 +829,19 @@ class KnowledgeGraphMemoryProvider(MemoryProvider):
                     """,
                     nodes=nodes,
                 ).consume()
-            grouped: Dict[str, List[Dict[str, str]]] = {}
+            grouped: Dict[
+                str,
+                List[Dict[str, str]],
+            ] = {}
             for relationship in relationships:
                 relationship_type = str(
                     relationship.get("type") or ""
                 )
                 if relationship_type in _ALLOWED_RELATIONSHIPS:
-                    grouped.setdefault(relationship_type, []).append(
-                        relationship
-                    )
+                    grouped.setdefault(
+                        relationship_type,
+                        [],
+                    ).append(relationship)
             for relationship_type, rows in grouped.items():
                 session.run(
                     f"""
@@ -866,6 +886,44 @@ class KnowledgeGraphMemoryProvider(MemoryProvider):
                 "Knowledge graph full-text search failed: %s",
                 exc,
             )
+            return self._substring_search(query, top_k)
+
+    def _substring_search(
+        self,
+        query: str,
+        top_k: int,
+    ) -> List[Dict[str, Any]]:
+        try:
+            with self._session() as session:
+                records = session.run(
+                    """
+                    MATCH (node:KgNode)
+                    WHERE toLower(
+                        coalesce(node.content, '')
+                    ) CONTAINS toLower($query)
+                       OR toLower(
+                           coalesce(node.title, '')
+                       ) CONTAINS toLower($query)
+                       OR toLower(
+                           coalesce(node.path, '')
+                       ) CONTAINS toLower($query)
+                    RETURN node.id AS id,
+                           node.kind AS kind,
+                           node.content AS content,
+                           node.title AS title,
+                           node.path AS path,
+                           0.1 AS score
+                    LIMIT $limit
+                    """,
+                    query=query,
+                    limit=top_k,
+                )
+                return [dict(record) for record in records]
+        except Exception as exc:
+            logger.debug(
+                "Knowledge graph substring search failed: %s",
+                exc,
+            )
             return []
 
     def _vector_search(
@@ -902,18 +960,28 @@ class KnowledgeGraphMemoryProvider(MemoryProvider):
             )
             return []
 
-    def _search(self, query: str, top_k: int) -> List[Dict[str, Any]]:
+    def _search(
+        self,
+        query: str,
+        top_k: int,
+    ) -> List[Dict[str, Any]]:
         top_k = max(1, min(int(top_k), 30))
         combined: Dict[str, Dict[str, Any]] = {}
         embedding = self._embed(query)
         sources = [
             (
                 "vector",
-                self._vector_search(embedding, top_k * 2)
+                self._vector_search(
+                    embedding,
+                    top_k * 2,
+                )
                 if embedding
                 else [],
             ),
-            ("fulltext", self._fulltext_search(query, top_k * 2)),
+            (
+                "fulltext",
+                self._fulltext_search(query, top_k * 2),
+            ),
         ]
         for source, rows in sources:
             for row in rows:
@@ -931,7 +999,9 @@ class KnowledgeGraphMemoryProvider(MemoryProvider):
                 current["sources"].append(source)
         return sorted(
             combined.values(),
-            key=lambda row: float(row.get("score") or 0),
+            key=lambda row: float(
+                row.get("score") or 0
+            ),
             reverse=True,
         )[:top_k]
 
@@ -962,10 +1032,15 @@ class KnowledgeGraphMemoryProvider(MemoryProvider):
                 )
                 if text:
                     lines.append(
-                        f"- {row.get('kind', 'node')}: {text[:500]}"
+                        "- "
+                        f"{row.get('kind', 'node')}: "
+                        f"{text[:500]}"
                     )
             value = "\n".join(lines)[
-                : int(self._cfg.get("prefetch_max_chars") or 1800)
+                : int(
+                    self._cfg.get("prefetch_max_chars")
+                    or 1800
+                )
             ]
             with self._prefetch_lock:
                 self._prefetch[key] = value
@@ -976,7 +1051,12 @@ class KnowledgeGraphMemoryProvider(MemoryProvider):
             daemon=True,
         ).start()
 
-    def prefetch(self, query: str, *, session_id: str = "") -> str:
+    def prefetch(
+        self,
+        query: str,
+        *,
+        session_id: str = "",
+    ) -> str:
         key = session_id or self._session_id or "default"
         with self._prefetch_lock:
             return self._prefetch.pop(key, "")
@@ -985,10 +1065,11 @@ class KnowledgeGraphMemoryProvider(MemoryProvider):
         if not self._available:
             return ""
         return (
-            "A Neo4j knowledge graph is active. Use kg_search before "
-            "assuming prior sessions, delegated work, ideas, or indexed "
-            "documents are unavailable. Reasoning capture is disabled "
-            "unless explicitly configured."
+            "A Neo4j knowledge graph is active. Use kg_search "
+            "before assuming prior sessions, delegated work, "
+            "ideas, or indexed documents are unavailable. "
+            "Reasoning, tool arguments, and tool results are "
+            "not stored unless explicitly enabled."
         )
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
@@ -996,14 +1077,17 @@ class KnowledgeGraphMemoryProvider(MemoryProvider):
             {
                 "name": "kg_search",
                 "description": (
-                    "Hybrid vector and full-text search across captured "
-                    "Hermes sessions and indexed documents."
+                    "Hybrid vector and full-text search across "
+                    "captured Hermes sessions and indexed documents."
                 ),
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "query": {"type": "string"},
-                        "top_k": {"type": "integer", "default": 8},
+                        "top_k": {
+                            "type": "integer",
+                            "default": 8,
+                        },
                     },
                     "required": ["query"],
                 },
@@ -1011,8 +1095,8 @@ class KnowledgeGraphMemoryProvider(MemoryProvider):
             {
                 "name": "kg_remember",
                 "description": (
-                    "Store a durable idea, decision, fact, or insight in "
-                    "the knowledge graph."
+                    "Store a durable idea, decision, fact, or "
+                    "insight in the knowledge graph."
                 ),
                 "parameters": {
                     "type": "object",
@@ -1029,8 +1113,8 @@ class KnowledgeGraphMemoryProvider(MemoryProvider):
             {
                 "name": "kg_index_docs",
                 "description": (
-                    "Index Markdown, text, or reStructuredText files into "
-                    "the knowledge graph."
+                    "Index Markdown, text, or reStructuredText "
+                    "files into the knowledge graph."
                 ),
                 "parameters": {
                     "type": "object",
@@ -1050,15 +1134,18 @@ class KnowledgeGraphMemoryProvider(MemoryProvider):
             {
                 "name": "kg_query",
                 "description": (
-                    "Run a read-only Cypher query for graph traversal and "
-                    "aggregation."
+                    "Run a bounded read-only Cypher query for "
+                    "graph traversal and aggregation."
                 ),
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "cypher": {"type": "string"},
                         "parameters": {"type": "object"},
-                        "limit": {"type": "integer", "default": 50},
+                        "limit": {
+                            "type": "integer",
+                            "default": 50,
+                        },
                     },
                     "required": ["cypher"],
                 },
@@ -1066,17 +1153,22 @@ class KnowledgeGraphMemoryProvider(MemoryProvider):
             {
                 "name": "kg_forget",
                 "description": (
-                    "Delete one knowledge-graph node by its stable ID."
+                    "Delete one knowledge-graph node by its "
+                    "stable ID."
                 ),
                 "parameters": {
                     "type": "object",
-                    "properties": {"node_id": {"type": "string"}},
+                    "properties": {
+                        "node_id": {"type": "string"},
+                    },
                     "required": ["node_id"],
                 },
             },
             {
                 "name": "kg_status",
-                "description": "Show provider status and durable queue depth.",
+                "description": (
+                    "Show provider status and durable queue depth."
+                ),
                 "parameters": {
                     "type": "object",
                     "properties": {},
@@ -1085,14 +1177,20 @@ class KnowledgeGraphMemoryProvider(MemoryProvider):
             },
         ]
 
-    def _tool_remember(self, args: Dict[str, Any]) -> Dict[str, Any]:
+    def _tool_remember(
+        self,
+        args: Dict[str, Any],
+    ) -> Dict[str, Any]:
         content = str(args.get("content") or "").strip()
         if not content:
             raise ValueError("content is required")
         node_id = f"idea:{_hash(content)}"
         props: Dict[str, Any] = {
             "content": content[:50000],
-            "tags": [str(tag) for tag in args.get("tags") or []][:50],
+            "tags": [
+                str(tag)
+                for tag in args.get("tags") or []
+            ][:50],
             "created_at": _utc_now(),
             "session_id": self._session_id,
         }
@@ -1109,12 +1207,20 @@ class KnowledgeGraphMemoryProvider(MemoryProvider):
             {
                 "type": "upsert",
                 "nodes": [
-                    {"id": node_id, "kind": "idea", "props": props}
+                    {
+                        "id": node_id,
+                        "kind": "idea",
+                        "props": props,
+                    }
                 ],
                 "relationships": relationships,
             }
         )
-        return {"ok": True, "node_id": node_id, "queued": True}
+        return {
+            "ok": True,
+            "node_id": node_id,
+            "queued": True,
+        }
 
     def _iter_documents(
         self,
@@ -1126,7 +1232,11 @@ class KnowledgeGraphMemoryProvider(MemoryProvider):
             if path.is_file():
                 yield path
             elif path.is_dir():
-                iterator = path.rglob("*") if recursive else path.glob("*")
+                iterator = (
+                    path.rglob("*")
+                    if recursive
+                    else path.glob("*")
+                )
                 for candidate in iterator:
                     if candidate.is_file():
                         yield candidate
@@ -1156,10 +1266,18 @@ class KnowledgeGraphMemoryProvider(MemoryProvider):
                 break
             position = max(position + 1, end - overlap)
 
-    def _tool_index_docs(self, args: Dict[str, Any]) -> Dict[str, Any]:
+    def _tool_index_docs(
+        self,
+        args: Dict[str, Any],
+    ) -> Dict[str, Any]:
         paths = args.get("paths") or []
         recursive = bool(args.get("recursive", True))
-        allowed = {".md", ".markdown", ".txt", ".rst"}
+        allowed = {
+            ".md",
+            ".markdown",
+            ".txt",
+            ".rst",
+        }
         files = 0
         chunks = 0
         skipped = 0
@@ -1187,7 +1305,8 @@ class KnowledgeGraphMemoryProvider(MemoryProvider):
             previous = ""
             for index, chunk in enumerate(self._chunks(text)):
                 node_id = (
-                    f"doc:{_hash(str(path))}:{index}:{_hash(chunk)}"
+                    f"doc:{_hash(str(path))}:{index}:"
+                    f"{_hash(chunk)}"
                 )
                 props: Dict[str, Any] = {
                     "path": str(path),
@@ -1196,7 +1315,9 @@ class KnowledgeGraphMemoryProvider(MemoryProvider):
                     "chunk_index": index,
                     "created_at": _utc_now(),
                 }
-                relationships: List[Dict[str, str]] = []
+                relationships: List[
+                    Dict[str, str]
+                ] = []
                 if previous:
                     relationships.append(
                         {
@@ -1227,21 +1348,30 @@ class KnowledgeGraphMemoryProvider(MemoryProvider):
             "skipped": skipped,
         }
 
-    def _tool_query(self, args: Dict[str, Any]) -> Dict[str, Any]:
+    def _tool_query(
+        self,
+        args: Dict[str, Any],
+    ) -> Dict[str, Any]:
         cypher = str(args.get("cypher") or "").strip()
         if not cypher:
             raise ValueError("cypher is required")
         if _WRITE_CYPHER.search(cypher):
             raise ValueError(
-                "kg_query is read-only; write clauses are not allowed"
+                "kg_query is read-only; "
+                "write clauses are not allowed"
             )
         if not re.match(
             r"^(MATCH|OPTIONAL\s+MATCH|RETURN|WITH|UNWIND)\b",
             cypher,
             re.IGNORECASE,
         ):
-            raise ValueError("unsupported read-only Cypher statement")
-        limit = max(1, min(int(args.get("limit") or 50), 200))
+            raise ValueError(
+                "unsupported read-only Cypher statement"
+            )
+        limit = max(
+            1,
+            min(int(args.get("limit") or 50), 200),
+        )
         with self._session() as session:
             records = session.run(
                 cypher,
@@ -1251,7 +1381,11 @@ class KnowledgeGraphMemoryProvider(MemoryProvider):
                 dict(record)
                 for _, record in zip(range(limit), records)
             ]
-        return {"ok": True, "rows": rows, "limit": limit}
+        return {
+            "ok": True,
+            "rows": rows,
+            "limit": limit,
+        }
 
     def handle_tool_call(
         self,
@@ -1275,11 +1409,17 @@ class KnowledgeGraphMemoryProvider(MemoryProvider):
                     }
                 )
             if tool_name == "kg_remember":
-                return _json_result(self._tool_remember(args))
+                return _json_result(
+                    self._tool_remember(args)
+                )
             if tool_name == "kg_index_docs":
-                return _json_result(self._tool_index_docs(args))
+                return _json_result(
+                    self._tool_index_docs(args)
+                )
             if tool_name == "kg_query":
-                return _json_result(self._tool_query(args))
+                return _json_result(
+                    self._tool_query(args)
+                )
             if tool_name == "kg_forget":
                 node_id = str(args.get("node_id") or "")
                 if not node_id:
@@ -1288,8 +1428,12 @@ class KnowledgeGraphMemoryProvider(MemoryProvider):
                     summary = session.run(
                         """
                         MATCH (n:KgNode {id: $id})
-                        WITH collect(n) AS nodes, count(n) AS deleted
-                        FOREACH (node IN nodes | DETACH DELETE node)
+                        WITH collect(n) AS nodes,
+                             count(n) AS deleted
+                        FOREACH (
+                            node IN nodes |
+                            DETACH DELETE node
+                        )
                         RETURN deleted
                         """,
                         id=node_id,
@@ -1298,7 +1442,9 @@ class KnowledgeGraphMemoryProvider(MemoryProvider):
                     {
                         "ok": True,
                         "deleted": int(
-                            summary["deleted"] if summary else 0
+                            summary["deleted"]
+                            if summary
+                            else 0
                         ),
                     }
                 )
@@ -1313,19 +1459,34 @@ class KnowledgeGraphMemoryProvider(MemoryProvider):
                             if self._queue
                             else 0
                         ),
-                        "reasoning_capture": bool(
-                            self._cfg.get("capture_reasoning")
+                        "reasoning_capture": self._as_bool(
+                            self._cfg.get(
+                                "capture_reasoning"
+                            )
                         ),
-                        "tool_argument_capture": bool(
-                            self._cfg.get("capture_tool_arguments")
+                        "tool_argument_capture": self._as_bool(
+                            self._cfg.get(
+                                "capture_tool_arguments"
+                            )
+                        ),
+                        "tool_result_capture": self._as_bool(
+                            self._cfg.get(
+                                "capture_tool_results"
+                            )
                         ),
                     }
                 )
             raise ValueError(
-                f"unknown knowledge graph tool: {tool_name}"
+                "unknown knowledge graph tool: "
+                f"{tool_name}"
             )
         except Exception as exc:
-            return _json_result({"ok": False, "error": str(exc)})
+            return _json_result(
+                {
+                    "ok": False,
+                    "error": str(exc),
+                }
+            )
 
     def backup_paths(self) -> List[str]:
         return []
@@ -1344,4 +1505,6 @@ class KnowledgeGraphMemoryProvider(MemoryProvider):
 
 
 def register(ctx) -> None:
-    ctx.register_memory_provider(KnowledgeGraphMemoryProvider())
+    ctx.register_memory_provider(
+        KnowledgeGraphMemoryProvider()
+    )
