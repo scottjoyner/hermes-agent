@@ -9,7 +9,7 @@ This provider gives Hermes a profile-scoped, cross-session knowledge graph witho
 - Uses Neo4j full-text search by default.
 - Adds vector search when one or more OpenAI-compatible local embedding endpoints are configured.
 - Fails over through the embedding endpoint list in order.
-- Keeps reasoning and raw tool arguments disabled by default.
+- Keeps reasoning, raw tool arguments, and raw tool results disabled by default.
 - Restricts `kg_query` to read-only Cypher and applies Hermes file-read safety checks during document indexing.
 
 ## Installation
@@ -47,6 +47,7 @@ knowledge_graph:
   embeddings_model: nomic-embed-text
   capture_reasoning: false
   capture_tool_arguments: false
+  capture_tool_results: false
 ```
 
 Set the password as a secret rather than committing it:
@@ -81,7 +82,13 @@ Supported environment overrides:
 
 ## Privacy defaults
 
-`capture_reasoning` and `capture_tool_arguments` default to `false`. Enabling either can persist sensitive model internals, commands, paths, or tool payloads. Document indexing follows Hermes' read-deny rules, but the graph database itself should still be treated as sensitive application state.
+The following settings default to `false`:
+
+- `capture_reasoning` prevents model reasoning fields from being persisted.
+- `capture_tool_arguments` replaces raw tool arguments with a redaction marker.
+- `capture_tool_results` replaces raw tool output with an omission marker while preserving the graph relationship between the call and its result.
+
+Enabling these settings can persist sensitive model internals, commands, paths, credentials, file contents, or external service responses. Document indexing follows Hermes' read-deny rules, but the graph database itself should still be treated as sensitive application state.
 
 ## Failure behavior
 
