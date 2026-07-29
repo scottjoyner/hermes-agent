@@ -4,6 +4,7 @@ import argparse
 import importlib.util
 import io
 import subprocess
+import sys
 from pathlib import Path
 from unittest import mock
 
@@ -41,13 +42,15 @@ class FakeContext:
 
 
 def load_plugin():
+    module_name = "test_rtk_rewrite_plugin_module"
     spec = importlib.util.spec_from_file_location(
-        "test_rtk_rewrite_plugin_module",
+        module_name,
         PLUGIN_PATH,
     )
     assert spec is not None
     assert spec.loader is not None
     module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
     spec.loader.exec_module(module)
     module._binary_checked = False
     module._cached_binary = None
@@ -273,7 +276,9 @@ def test_install_auto_prefers_brew_then_cargo():
     with mock.patch.object(
         module.shutil,
         "which",
-        side_effect=lambda name: "/opt/homebrew/bin/brew" if name == "brew" else None,
+        side_effect=lambda name: (
+            "/opt/homebrew/bin/brew" if name == "brew" else None
+        ),
     ):
         assert module._install_command("auto") == [
             "brew",
@@ -284,7 +289,9 @@ def test_install_auto_prefers_brew_then_cargo():
     with mock.patch.object(
         module.shutil,
         "which",
-        side_effect=lambda name: "/usr/bin/cargo" if name == "cargo" else None,
+        side_effect=lambda name: (
+            "/usr/bin/cargo" if name == "cargo" else None
+        ),
     ):
         assert module._install_command("auto") == [
             "cargo",
