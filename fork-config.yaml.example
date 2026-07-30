@@ -1,0 +1,106 @@
+# Hermes fork deployment template
+# Copy the relevant sections into $HERMES_HOME/config.yaml.
+# Secrets belong in $HERMES_HOME/.env or a configured secret source.
+
+model:
+  # Choose `lmstudio` for LM Studio or `custom` for another OpenAI-compatible
+  # endpoint such as llama.cpp, vLLM, or Ollama.
+  provider: lmstudio
+  default: local-model-id
+  base_url: http://127.0.0.1:1234/v1
+
+  # Local servers do not always report the configured context window correctly.
+  # Set the real total input + output window explicitly.
+  context_length: 65536
+
+plugins:
+  enabled:
+    - fork-operations
+    - rtk-rewrite
+    - cache-foundation
+    - security-guidance
+
+memory:
+  memory_enabled: true
+  user_profile_enabled: true
+  provider: knowledge_graph
+
+knowledge_graph:
+  enabled: true
+  uri: bolt://127.0.0.1:7687
+  user: neo4j
+  database: neo4j
+  embeddings_base_urls:
+    - http://xwing:1234/v1
+    - http://tie:1234/v1
+  embeddings_model: nomic-embed-text
+
+  # Privacy-safe defaults. Enabling these can persist commands, paths,
+  # credentials, provider responses, file contents, or model internals.
+  capture_reasoning: false
+  capture_tool_arguments: false
+  capture_tool_results: false
+
+# Create a separate Git worktree for each coding session. This prevents two
+# agents from editing the same checkout concurrently.
+worktree: true
+worktree_sync: true
+
+# Prefer SSH or Docker over unrestricted local execution. Adjust this block per
+# machine; the example keeps agent code local and executes tools on xwing.
+terminal:
+  backend: ssh
+  cwd: /home/scott/git
+  timeout: 180
+  lifetime_seconds: 300
+  ssh_host: xwing
+  ssh_user: scott
+  ssh_port: 22
+  ssh_key: ~/.ssh/id_ed25519
+
+compression:
+  enabled: true
+
+  # Preserve only the system prompt at the fixed head. The rolling summary and
+  # recent tail carry the active task context in long-running sessions.
+  protect_first_n: 0
+  protect_last_n: 20
+  min_tail_user_messages: 3
+  max_attempts: 4
+
+  # Keep deterministic proactive pruning disabled until cache-hit telemetry is
+  # meaningful. A committed prune rewrites history and invalidates the current
+  # provider prefix cache.
+  proactive_prune_tokens: 0
+  proactive_prune_min_result_chars: 8000
+  proactive_prune_min_reclaim_tokens: 4096
+
+# Route cheap text-only side tasks to a smaller local model when the primary
+# endpoint can select multiple models. Keep vision on a multimodal-capable slot.
+auxiliary:
+  compression:
+    provider: main
+    model: small-fast-text-model
+    reasoning_effort: low
+    timeout: 180
+
+  title_generation:
+    enabled: true
+    provider: main
+    model: small-fast-text-model
+    reasoning_effort: none
+    timeout: 30
+
+  web_extract:
+    provider: main
+    model: small-fast-text-model
+    reasoning_effort: low
+    timeout: 60
+
+# Keep platform users isolated from one another unless a shared room brain is
+# explicitly intended.
+group_sessions_per_user: true
+
+# Limit concurrent active sessions on smaller controller machines. Increase or
+# remove only after measuring model queue and memory pressure.
+max_concurrent_sessions: 4
