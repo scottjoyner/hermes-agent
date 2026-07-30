@@ -1,9 +1,7 @@
-"""Operational diagnostics for the scottjoyner Hermes Agent fork.
+"""Operational diagnostics for the maintained Scott Joyner Hermes fork.
 
-This bundled plugin is intentionally read-only by default. It inspects Git
-remote topology, upstream drift, configuration posture, and the three custom
-integrations carried by this fork. The only mutating option is the explicit
-``--repair-remotes`` flag, which adds a missing ``upstream`` remote.
+The plugin is read-only by default. ``--repair-remotes`` is the only mutating
+option and adds a missing ``upstream`` remote without rewriting an existing one.
 """
 
 from __future__ import annotations
@@ -18,6 +16,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
+from urllib.parse import urlsplit, urlunsplit
 
 from hermes_constants import get_hermes_home
 from utils import fast_safe_load
@@ -25,12 +24,12 @@ from utils import fast_safe_load
 _DEFAULT_UPSTREAM_URL = "https://github.com/NousResearch/hermes-agent.git"
 _DEFAULT_BACKUP_REF = "backup/pre-upstream-reconcile-2026-07-29"
 _TRUE_VALUES = {"1", "true", "yes", "on"}
+_FALSE_VALUES = {"0", "false", "no", "off", ""}
+_SECRET_URL_KEYS = {"url", "uri"}
 
 
 @dataclass(frozen=True)
 class CheckResult:
-    """One bounded, secret-free diagnostic result."""
-
     name: str
     status: str
     message: str
@@ -42,8 +41,6 @@ class CheckResult:
 
 @dataclass(frozen=True)
 class DriftReport:
-    """Git ancestry relationship between the published fork and upstream."""
-
     available: bool
     base_ref: str
     upstream_ref: str
@@ -59,7 +56,46 @@ class DriftReport:
 
 
 def _truthy(value: Any) -> bool:
-    return str(value or "").strip().lower() in _TRUE_VALUES
+    if isinstance(value, bool):
+        return value
+    normalized = str(value or "").strip().lower()
+    if normalized in _TRUE_VALUES:
+        return True
+    if normalized in _FALSE_VALUES:
+        return False
+    return bool(value)
+
+
+def _redact_url(value: Any) -> str:
+    """Remove URL credentials, query strings, and fragments."""
+
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    if "://" not in raw:
+        # Git's scp-like syntax: user@host:owner/repo.git. The user segment is
+        # not needed for diagnostics and can contain a token in unusual setups.
+        if "@" in raw:
+            return raw.split("@", 1)[1]
+        return raw
+    try:
+        parsed = urlsplit(raw)
+        host = parsed.hostname or ""
+        if ":" in host and not host.startswith("["):
+            host = f"[{host}]"
+        port = f":{parsed.port}" if parsed.port else ""
+        return urlunsplit((parsed.scheme, f"{host}{port}", parsed.path, "", ""))
+    except (ValueError, TypeError):
+        return "<redacted-url>"
+
+
+def _safe_details(details: Mapping[str, Any]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in details.items():
+        if value == "":
+            continue
+        result[key] = _redact_url(value) if key in _SECRET_URL_KEYS else value
+    return result
 
 
 def _run_git(
@@ -85,9 +121,7 @@ def _run_git(
 def _repo_root(candidate: str | Path | None = None) -> Path | None:
     cwd = Path(candidate).expanduser() if candidate else Path.cwd()
     result = _run_git(["rev-parse", "--show-toplevel"], cwd=cwd)
-    if result.returncode != 0:
-        return None
-    value = result.stdout.strip()
+    value = result.stdout.strip() if result.returncode == 0 else ""
     return Path(value) if value else None
 
 
@@ -97,8 +131,10 @@ def _git_value(root: Path, args: Sequence[str]) -> str:
 
 
 def _ref_exists(root: Path, ref: str) -> bool:
-    result = _run_git(["rev-parse", "--verify", "--quiet", ref], cwd=root)
-    return result.returncode == 0
+    return (
+        _run_git(["rev-parse", "--verify", "--quiet", ref], cwd=root).returncode
+        == 0
+    )
 
 
 def _remote_url(root: Path, name: str) -> str:
@@ -106,21 +142,17 @@ def _remote_url(root: Path, name: str) -> str:
 
 
 def _upstream_url() -> str:
-    return (
-        os.getenv("HERMES_FORK_UPSTREAM_URL", "").strip()
-        or _DEFAULT_UPSTREAM_URL
-    )
+    return os.getenv("HERMES_FORK_UPSTREAM_URL", "").strip() or _DEFAULT_UPSTREAM_URL
 
 
 def _ensure_upstream_remote(root: Path, *, repair: bool) -> tuple[str, str]:
     current = _remote_url(root, "upstream")
-    expected = _upstream_url()
     if current or not repair:
         return current, ""
+    expected = _upstream_url()
     result = _run_git(["remote", "add", "upstream", expected], cwd=root)
     if result.returncode != 0:
-        error = result.stderr.strip() or "git remote add failed"
-        return "", error
+        return "", result.stderr.strip() or "git remote add failed"
     return expected, ""
 
 
@@ -130,9 +162,9 @@ def _fetch_upstream(root: Path) -> str:
         cwd=root,
         timeout=180.0,
     )
-    if result.returncode == 0:
-        return ""
-    return result.stderr.strip() or "git fetch upstream main failed"
+    return "" if result.returncode == 0 else (
+        result.stderr.strip() or "git fetch upstream main failed"
+    )
 
 
 def collect_drift(
@@ -141,74 +173,50 @@ def collect_drift(
     fetch: bool = False,
     repair_remotes: bool = False,
 ) -> DriftReport:
-    """Return fork/upstream ancestry counts without changing branches."""
-
     root = _repo_root(repo)
     if root is None:
-        return DriftReport(
-            available=False,
-            base_ref="",
-            upstream_ref="",
-            error="not inside a Git worktree",
-        )
+        return DriftReport(False, "", "", error="not inside a Git worktree")
 
     upstream_url, remote_error = _ensure_upstream_remote(
         root,
         repair=repair_remotes,
     )
     if remote_error:
-        return DriftReport(
-            available=False,
-            base_ref="",
-            upstream_ref="upstream/main",
-            error=remote_error,
-        )
+        return DriftReport(False, "", "upstream/main", error=remote_error)
     if not upstream_url:
         return DriftReport(
-            available=False,
-            base_ref="",
-            upstream_ref="upstream/main",
+            False,
+            "",
+            "upstream/main",
             error=(
                 "missing upstream remote; run with --repair-remotes or add "
-                f"{_upstream_url()}"
+                f"{_redact_url(_upstream_url())}"
             ),
         )
-
     if fetch:
         fetch_error = _fetch_upstream(root)
         if fetch_error:
-            return DriftReport(
-                available=False,
-                base_ref="",
-                upstream_ref="upstream/main",
-                error=fetch_error,
-            )
+            return DriftReport(False, "", "upstream/main", error=fetch_error)
 
-    configured_base = os.getenv("HERMES_FORK_BASE_REF", "").strip()
-    base_ref = configured_base or (
+    base_ref = os.getenv("HERMES_FORK_BASE_REF", "").strip() or (
         "origin/main" if _ref_exists(root, "origin/main") else "main"
     )
     upstream_ref = (
-        os.getenv("HERMES_FORK_UPSTREAM_REF", "").strip()
-        or "upstream/main"
+        os.getenv("HERMES_FORK_UPSTREAM_REF", "").strip() or "upstream/main"
     )
-
     if not _ref_exists(root, base_ref):
         return DriftReport(
-            available=False,
-            base_ref=base_ref,
-            upstream_ref=upstream_ref,
+            False,
+            base_ref,
+            upstream_ref,
             error=f"base ref does not exist: {base_ref}",
         )
     if not _ref_exists(root, upstream_ref):
         return DriftReport(
-            available=False,
-            base_ref=base_ref,
-            upstream_ref=upstream_ref,
-            error=(
-                f"upstream ref does not exist: {upstream_ref}; "
-                "rerun with --fetch"
-            ),
+            False,
+            base_ref,
+            upstream_ref,
+            error=f"upstream ref does not exist: {upstream_ref}; rerun with --fetch",
         )
 
     result = _run_git(
@@ -217,28 +225,26 @@ def collect_drift(
     )
     if result.returncode != 0:
         return DriftReport(
-            available=False,
-            base_ref=base_ref,
-            upstream_ref=upstream_ref,
+            False,
+            base_ref,
+            upstream_ref,
             error=result.stderr.strip() or "git rev-list failed",
         )
-
     try:
         ahead_text, behind_text = result.stdout.split()
-        ahead = int(ahead_text)
-        behind = int(behind_text)
+        ahead, behind = int(ahead_text), int(behind_text)
     except (TypeError, ValueError):
         return DriftReport(
-            available=False,
-            base_ref=base_ref,
-            upstream_ref=upstream_ref,
+            False,
+            base_ref,
+            upstream_ref,
             error=f"unexpected git rev-list output: {result.stdout.strip()!r}",
         )
 
     return DriftReport(
-        available=True,
-        base_ref=base_ref,
-        upstream_ref=upstream_ref,
+        True,
+        base_ref,
+        upstream_ref,
         ahead=ahead,
         behind=behind,
         base_sha=_git_value(root, ["rev-parse", base_ref]),
@@ -272,10 +278,8 @@ def _mapping(value: Any) -> dict[str, Any]:
     return dict(value) if isinstance(value, Mapping) else {}
 
 
-def _list_of_strings(value: Any) -> list[str]:
-    if not isinstance(value, list):
-        return []
-    return [str(item) for item in value if isinstance(item, str)]
+def _strings(value: Any) -> list[str]:
+    return [item for item in value if isinstance(item, str)] if isinstance(value, list) else []
 
 
 def _add(
@@ -285,14 +289,7 @@ def _add(
     message: str,
     **details: Any,
 ) -> None:
-    checks.append(
-        CheckResult(
-            name=name,
-            status=status,
-            message=message,
-            details={key: value for key, value in details.items() if value != ""},
-        )
-    )
+    checks.append(CheckResult(name, status, message, _safe_details(details)))
 
 
 def collect_checks(
@@ -301,8 +298,6 @@ def collect_checks(
     fetch: bool = False,
     repair_remotes: bool = False,
 ) -> tuple[Path | None, list[CheckResult], DriftReport]:
-    """Collect read-only operational checks for the fork and local profile."""
-
     checks: list[CheckResult] = []
     root = _repo_root(repo)
     if root is None:
@@ -315,7 +310,6 @@ def collect_checks(
         return None, checks, drift
 
     _add(checks, "git.worktree", "ok", "Git worktree detected", path=str(root))
-
     branch = _git_value(root, ["branch", "--show-current"]) or "detached"
     dirty = bool(_git_value(root, ["status", "--porcelain"]))
     _add(
@@ -335,22 +329,19 @@ def collect_checks(
     if not origin:
         _add(checks, "git.origin", "error", "origin remote is missing")
     else:
-        expected_fork = "scottjoyner/hermes-agent"
-        status = "ok" if expected_fork.lower() in origin.lower() else "warning"
+        expected = "scottjoyner/hermes-agent"
+        ok = expected.lower() in origin.lower()
         _add(
             checks,
             "git.origin",
-            status,
+            "ok" if ok else "warning",
             "origin points to the maintained fork"
-            if status == "ok"
+            if ok
             else "origin does not appear to point to scottjoyner/hermes-agent",
             url=origin,
         )
 
-    upstream, remote_error = _ensure_upstream_remote(
-        root,
-        repair=repair_remotes,
-    )
+    upstream, remote_error = _ensure_upstream_remote(root, repair=repair_remotes)
     if remote_error:
         _add(checks, "git.upstream", "error", remote_error)
     elif not upstream:
@@ -359,19 +350,17 @@ def collect_checks(
             "git.upstream",
             "warning",
             "upstream remote is missing",
-            repair=(
-                "hermes fork-doctor --repair-remotes --fetch"
-            ),
+            repair="hermes fork-doctor --repair-remotes --fetch",
         )
     else:
         expected = "NousResearch/hermes-agent"
-        status = "ok" if expected.lower() in upstream.lower() else "warning"
+        ok = expected.lower() in upstream.lower()
         _add(
             checks,
             "git.upstream",
-            status,
+            "ok" if ok else "warning",
             "upstream points to NousResearch/hermes-agent"
-            if status == "ok"
+            if ok
             else "upstream points to an unexpected repository",
             url=upstream,
         )
@@ -383,30 +372,22 @@ def collect_checks(
     )
     if not drift.available:
         _add(checks, "git.drift", "warning", drift.error)
-    elif drift.behind:
-        _add(
-            checks,
-            "git.drift",
-            "warning",
-            f"fork is {drift.behind} commit(s) behind upstream",
-            ahead=drift.ahead,
-            behind=drift.behind,
-        )
     else:
         _add(
             checks,
             "git.drift",
-            "ok",
-            "fork contains the current upstream ancestry",
+            "warning" if drift.behind else "ok",
+            f"fork is {drift.behind} commit(s) behind upstream"
+            if drift.behind
+            else "fork contains the current upstream ancestry",
             ahead=drift.ahead,
             behind=drift.behind,
         )
 
-    backup_refs = (
-        _DEFAULT_BACKUP_REF,
-        f"origin/{_DEFAULT_BACKUP_REF}",
+    backup_present = any(
+        _ref_exists(root, ref)
+        for ref in (_DEFAULT_BACKUP_REF, f"origin/{_DEFAULT_BACKUP_REF}")
     )
-    backup_present = any(_ref_exists(root, ref) for ref in backup_refs)
     _add(
         checks,
         "git.backup",
@@ -417,7 +398,7 @@ def collect_checks(
         ref=_DEFAULT_BACKUP_REF,
     )
 
-    home = get_hermes_home()
+    home = Path(get_hermes_home())
     config_path = home / "config.yaml"
     config = _load_yaml(config_path)
     _add(
@@ -430,35 +411,32 @@ def collect_checks(
         path=str(config_path),
     )
 
-    plugins_cfg = _mapping(config.get("plugins"))
-    enabled_plugins = set(_list_of_strings(plugins_cfg.get("enabled")))
+    enabled = set(_strings(_mapping(config.get("plugins")).get("enabled")))
     for plugin_name in ("rtk-rewrite", "cache-foundation"):
-        enabled = plugin_name in enabled_plugins
+        active = plugin_name in enabled
         _add(
             checks,
             f"plugin.{plugin_name}",
-            "ok" if enabled else "warning",
+            "ok" if active else "warning",
             f"{plugin_name} is enabled"
-            if enabled
+            if active
             else f"{plugin_name} is disabled",
             enable=f"hermes plugins enable {plugin_name}",
         )
 
-    rtk_binary = shutil.which(os.getenv("HERMES_RTK_BINARY", "").strip() or "rtk")
+    rtk = shutil.which(os.getenv("HERMES_RTK_BINARY", "").strip() or "rtk")
     _add(
         checks,
         "rtk.binary",
-        "ok" if rtk_binary else "warning",
-        "RTK binary is available"
-        if rtk_binary
-        else "RTK binary is not available on PATH",
-        binary=rtk_binary or "",
+        "ok" if rtk else "warning",
+        "RTK binary is available" if rtk else "RTK binary is not available on PATH",
+        binary=rtk or "",
         repair="hermes rtk install",
     )
 
-    memory_cfg = _mapping(config.get("memory"))
-    memory_provider = str(memory_cfg.get("provider") or "").strip()
-    kg_active = memory_provider == "knowledge_graph"
+    memory = _mapping(config.get("memory"))
+    provider = str(memory.get("provider") or "").strip()
+    kg_active = provider == "knowledge_graph"
     _add(
         checks,
         "memory.provider",
@@ -466,44 +444,42 @@ def collect_checks(
         "knowledge_graph is the active external memory provider"
         if kg_active
         else "knowledge_graph is not the active external memory provider",
-        provider=memory_provider or "built-in only",
+        provider=provider or "built-in only",
         repair="hermes memory setup",
     )
-
-    kg_config = _mapping(config.get("knowledge_graph"))
-    kg_config.update(_load_json(home / "knowledge_graph.json"))
-    kg_uri = str(os.getenv("NEO4J_URI") or kg_config.get("uri") or "").strip()
-    kg_password_present = bool(os.getenv("NEO4J_PASSWORD", "").strip())
     if kg_active:
+        kg = _mapping(config.get("knowledge_graph"))
+        kg.update(_load_json(home / "knowledge_graph.json"))
+        uri = str(os.getenv("NEO4J_URI") or kg.get("uri") or "").strip()
+        password_present = bool(os.getenv("NEO4J_PASSWORD", "").strip())
         _add(
             checks,
             "memory.neo4j_uri",
-            "ok" if kg_uri else "error",
-            "Neo4j URI is configured" if kg_uri else "Neo4j URI is missing",
-            uri=kg_uri,
+            "ok" if uri else "error",
+            "Neo4j URI is configured" if uri else "Neo4j URI is missing",
+            uri=uri,
         )
         _add(
             checks,
             "memory.neo4j_password",
-            "ok" if kg_password_present else "error",
+            "ok" if password_present else "error",
             "Neo4j password is available from the environment"
-            if kg_password_present
+            if password_present
             else "NEO4J_PASSWORD is not available",
         )
 
-    cache_enabled = "cache-foundation" in enabled_plugins
-    stable_prefix = os.getenv("HERMES_CACHE_STABLE_PREFIX_FILE", "").strip()
-    if cache_enabled:
-        prefix_path = Path(stable_prefix).expanduser() if stable_prefix else None
-        prefix_ready = bool(prefix_path and prefix_path.is_file())
+    if "cache-foundation" in enabled:
+        raw_prefix = os.getenv("HERMES_CACHE_STABLE_PREFIX_FILE", "").strip()
+        prefix = Path(raw_prefix).expanduser() if raw_prefix else None
+        ready = bool(prefix and prefix.is_file())
         _add(
             checks,
             "cache.stable_prefix",
-            "ok" if prefix_ready else "warning",
+            "ok" if ready else "warning",
             "stable-prefix file is configured"
-            if prefix_ready
+            if ready
             else "stable-prefix file is not configured or readable",
-            path=str(prefix_path) if prefix_path else "",
+            path=str(prefix) if prefix else "",
         )
         remote_cache = _truthy(os.getenv("HERMES_CACHE_ALLOW_REMOTE"))
         _add(
@@ -515,17 +491,10 @@ def collect_checks(
             else "remote cache identifier disclosure is disabled",
         )
 
-    model_cfg = _mapping(config.get("model"))
-    provider = str(model_cfg.get("provider") or "auto").strip().lower()
-    local_provider = provider in {
-        "custom",
-        "lmstudio",
-        "ollama",
-        "vllm",
-        "llamacpp",
-    }
-    context_length = model_cfg.get("context_length")
-    if local_provider:
+    model = _mapping(config.get("model"))
+    model_provider = str(model.get("provider") or "auto").strip().lower()
+    if model_provider in {"custom", "lmstudio", "ollama", "vllm", "llamacpp"}:
+        context_length = model.get("context_length")
         _add(
             checks,
             "model.context_length",
@@ -536,21 +505,18 @@ def collect_checks(
             context_length=context_length or "",
         )
 
-    terminal_cfg = _mapping(config.get("terminal"))
-    terminal_backend = str(terminal_cfg.get("backend") or "local").strip()
+    terminal = _mapping(config.get("terminal"))
+    backend = str(terminal.get("backend") or "local").strip()
     _add(
         checks,
         "terminal.isolation",
-        "ok" if terminal_backend != "local" else "warning",
-        f"terminal backend is {terminal_backend}",
+        "ok" if backend != "local" else "warning",
+        f"terminal backend is {backend}",
         recommendation=(
-            "prefer ssh or docker for stronger isolation"
-            if terminal_backend == "local"
-            else ""
+            "prefer ssh or docker for stronger isolation" if backend == "local" else ""
         ),
     )
-
-    worktree_enabled = bool(config.get("worktree"))
+    worktree_enabled = _truthy(config.get("worktree"))
     _add(
         checks,
         "git.worktree_isolation",
@@ -559,7 +525,6 @@ def collect_checks(
         if worktree_enabled
         else "automatic Git worktree isolation is disabled",
     )
-
     return root, checks, drift
 
 
@@ -593,8 +558,10 @@ def _print_doctor(payload: Mapping[str, Any]) -> None:
     print()
     for check in payload.get("checks", []):
         status = str(check.get("status") or "warning")
-        label = symbols.get(status, status.upper())
-        print(f"[{label:5}] {check.get('name')}: {check.get('message')}")
+        print(
+            f"[{symbols.get(status, status.upper()):5}] "
+            f"{check.get('name')}: {check.get('message')}"
+        )
         details = check.get("details")
         if isinstance(details, Mapping):
             for key, value in details.items():
@@ -602,8 +569,7 @@ def _print_doctor(payload: Mapping[str, Any]) -> None:
     summary = payload.get("summary", {})
     print()
     print(
-        "summary: "
-        f"{summary.get('ok', 0)} ok, "
+        f"summary: {summary.get('ok', 0)} ok, "
         f"{summary.get('warning', 0)} warning(s), "
         f"{summary.get('error', 0)} error(s)"
     )
@@ -611,22 +577,10 @@ def _print_doctor(payload: Mapping[str, Any]) -> None:
 
 def _setup_doctor(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--repo", default=".", help="Git worktree to inspect")
-    parser.add_argument(
-        "--fetch",
-        action="store_true",
-        help="Fetch upstream/main before calculating drift",
-    )
-    parser.add_argument(
-        "--repair-remotes",
-        action="store_true",
-        help="Add a missing upstream remote before inspection",
-    )
+    parser.add_argument("--fetch", action="store_true")
+    parser.add_argument("--repair-remotes", action="store_true")
     parser.add_argument("--json", action="store_true")
-    parser.add_argument(
-        "--strict",
-        action="store_true",
-        help="Return non-zero for warnings as well as errors",
-    )
+    parser.add_argument("--strict", action="store_true")
     parser.set_defaults(func=_handle_doctor)
 
 
@@ -651,22 +605,10 @@ def _handle_doctor(args: argparse.Namespace) -> int:
 
 def _setup_drift(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--repo", default=".", help="Git worktree to inspect")
-    parser.add_argument(
-        "--fetch",
-        action="store_true",
-        help="Fetch upstream/main before calculating drift",
-    )
-    parser.add_argument(
-        "--repair-remotes",
-        action="store_true",
-        help="Add a missing upstream remote before inspection",
-    )
+    parser.add_argument("--fetch", action="store_true")
+    parser.add_argument("--repair-remotes", action="store_true")
     parser.add_argument("--json", action="store_true")
-    parser.add_argument(
-        "--strict",
-        action="store_true",
-        help="Return non-zero when the fork is behind upstream",
-    )
+    parser.add_argument("--strict", action="store_true")
     parser.set_defaults(func=_handle_drift)
 
 
@@ -680,24 +622,17 @@ def _handle_drift(args: argparse.Namespace) -> int:
         print(json.dumps(report.to_dict(), indent=2, sort_keys=True))
     elif report.available:
         print(f"base ref     : {report.base_ref} ({report.base_sha[:12]})")
-        print(
-            f"upstream ref : {report.upstream_ref} "
-            f"({report.upstream_sha[:12]})"
-        )
+        print(f"upstream ref : {report.upstream_ref} ({report.upstream_sha[:12]})")
         print(f"ahead        : {report.ahead}")
         print(f"behind       : {report.behind}")
         print(f"merge base   : {report.merge_base_sha[:12]}")
     else:
         print(f"fork drift unavailable: {report.error}", file=sys.stderr)
         return 2
-    if bool(getattr(args, "strict", False)) and report.behind:
-        return 1
-    return 0
+    return 1 if bool(getattr(args, "strict", False)) and report.behind else 0
 
 
 def register(ctx: Any) -> None:
-    """Register fork diagnostics without changing agent runtime behavior."""
-
     register_cli = getattr(ctx, "register_cli_command", None)
     if not callable(register_cli):
         return
