@@ -46,16 +46,44 @@ Hermes may not:
 
 OpenCode is a separate, lower-priority executor integration. It may receive explicitly assigned repository work, but it is not a fallback inference provider and must not change Hermes or fleet routing configuration. Disabling OpenCode must not change the inference path used by Hermes.
 
-## Initial deployment settings
+## Normal deployment settings
 
 Configure Hermes with one model provider entry pointing to the local gateway, for example:
 
 ```text
 base URL: http://auto-router:8088/v1
-API key: local-router
+API key: local-offline-only
 model alias: auto/code or auto/high-quality
 ```
 
 The exact Hermes configuration surface may evolve with upstream. The invariant is more important than the file format: the only model endpoint visible to the fleet Hermes worker should be the strict-offline gateway.
 
-See `auto-assist/docs/FULL_AUTO_RECONCILIATION_20260730.md` on the matching branch for the canonical architecture and acceptance gates.
+## Shadow migration settings
+
+The old production executor remains running while the control plane and router are
+validated. The shadow Hermes adapter must therefore remain off until identity,
+capacity, state-authority, restart, and rollback gates pass.
+
+The matching `auto-assist` reconciliation Compose file places `hermes-adapter`
+behind the explicit `executor` profile. When approved for one synthetic task, use:
+
+```text
+AssistX shadow URL: http://api:8000 inside the reconciliation network
+Router shadow URL: http://host.docker.internal:18088/v1
+Model alias: local/reconciliation-default
+Self-task generation: disabled
+Max tasks per loop: 1
+Recovery execution: disabled
+Repository mutation: disabled
+```
+
+The shadow Hermes agent may execute only a synthetic task. It must not inspect or
+modify production repositories, start another agent, load a model, or continue
+running after the gate unless the operator approves extended shadow operation.
+
+See the matching `auto-assist` branch:
+
+- `docs/FULL_AUTO_RECONCILIATION_20260730.md` for architecture and acceptance gates;
+- `docs/LOCAL_AGENT_LIVE_MIGRATION_RUNBOOK_20260730.md` for the exact side-by-side sequence;
+- `docs/LOCAL_AGENT_HANDOFF_20260730.md` for local-agent authority and evidence requirements;
+- `deploy/reconciliation/system-inventory.yaml` for the full required system/service inventory.
