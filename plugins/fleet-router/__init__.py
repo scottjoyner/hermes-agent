@@ -8,6 +8,7 @@ import threading
 from dataclasses import asdict
 from typing import Any, Mapping
 
+from . import core
 from .core import (
     FleetConfig,
     FleetNodeConfig,
@@ -16,7 +17,13 @@ from .core import (
     RouteRequirements,
     parse_fleet_config,
 )
-from .proxy import is_loopback_bind, serve
+from .sizing import requirements_from_payload as _requirements_from_payload
+
+# The proxy imports its sizing callable from core for a narrow dependency graph.
+# Install the full request-envelope estimator before importing the proxy module.
+setattr(core, "requirements_from_payload", _requirements_from_payload)
+
+from .proxy import is_loopback_bind, serve  # noqa: E402
 
 _ROUTER: FleetRouter | None = None
 _ROUTER_LOCK = threading.RLock()
