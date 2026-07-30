@@ -1,0 +1,57 @@
+# Standalone Hermes fleet mode for installations that do NOT use AssistX and
+# auto-router. Do not combine this node registry with the reconciled deployment.
+
+model:
+  provider: custom
+  default: local-coder
+  base_url: http://127.0.0.1:8765/v1
+  context_length: 32768
+
+fleet:
+  mode: standalone
+  enabled: true
+  health_ttl_seconds: 30
+  default_max_output_tokens: 4096
+  max_attempts: 2
+
+  listen:
+    host: 127.0.0.1
+    port: 8765
+    allow_non_loopback: false
+
+  nodes:
+    - name: primary-large
+      base_url: http://primary-large.lan:1234/v1
+      provider: lmstudio
+      context_length: 32768
+      max_concurrency: 1
+      prefill_tokens_per_second: 80
+      decode_tokens_per_second: 18
+      supports_tools: true
+      supports_vision: false
+      supports_reasoning: true
+      models:
+        - local-large-model-id
+      model_map:
+        local-coder: local-large-model-id
+
+    - name: fast-small
+      base_url: http://fast-small.lan:1234/v1
+      provider: lmstudio
+      context_length: 16384
+      max_concurrency: 2
+      prefill_tokens_per_second: 120
+      decode_tokens_per_second: 30
+      supports_tools: true
+      supports_vision: false
+      supports_reasoning: true
+      models:
+        - local-small-model-id
+      model_map:
+        local-fast: local-small-model-id
+
+plugins:
+  enabled:
+    - small-model-context
+    - fleet-router
+    - cache-foundation
