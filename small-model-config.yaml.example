@@ -1,78 +1,42 @@
 # Copy the relevant sections into $HERMES_HOME/config.yaml.
-# This template minimizes always-on context and routes local inference through
-# an explicit Headroom-aware fleet without removing tools or skills.
+# This is the recommended reconciled deployment: Hermes is an executor and sees
+# only auto-router. AssistX/Neo4j owns fleet identity, inventory, capacity,
+# assignments, claims, leases, access paths, and recovery.
 
 model:
   provider: custom
-  default: local-coder
-  base_url: http://127.0.0.1:8765/v1
+  default: auto/code
+  base_url: http://auto-router-reconciliation:8088/v1
 
-  # Use a conservative context available across the nodes intended for the main
-  # agent. The fleet router separately rejects any node that cannot fit a
-  # specific request plus its requested output and safety margin.
+  # This value sizes Hermes prompt/context behavior only. auto-router and AssistX
+  # independently enforce the admitted model/runtime context window.
   context_length: 32768
 
 fleet:
-  enabled: true
-  health_ttl_seconds: 30
-  default_max_output_tokens: 4096
-  max_attempts: 2
+  mode: external  # external | standalone | disabled
 
-  # Loopback is the safe default. A non-loopback bind must be explicitly enabled
-  # and should also set token_env to a dedicated inbound bearer token.
-  listen:
-    host: 127.0.0.1
-    port: 8765
-    allow_non_loopback: false
-    # token_env: HERMES_FLEET_LISTEN_TOKEN
+  external:
+    base_url: http://auto-router-reconciliation:8088/v1
+    admin_url: http://auto-router-reconciliation:8088
+    api_key_env: AUTO_ROUTER_CLIENT_TOKEN
+    admin_token_env: AUTO_ROUTER_ADMIN_TOKEN
+    default_model: auto/code
+    strict_offline: true
+    timeout_seconds: 10
 
-  # Only explicitly listed nodes are contacted. There are no built-in hostnames,
-  # tailnet names, subnet scans, or implicitly forwarded provider credentials.
-  nodes:
-    - name: primary-large
-      base_url: http://primary-large.lan:1234/v1
-      provider: lmstudio
-      context_length: 32768
-      max_concurrency: 1
-      prefill_tokens_per_second: 80
-      decode_tokens_per_second: 18
-      supports_tools: true
-      supports_vision: false
-      supports_reasoning: true
-      models:
-        - local-large-model-id
-      model_map:
-        local-coder: local-large-model-id
-
-    - name: fast-small
-      base_url: http://fast-small.lan:1234/v1
-      provider: lmstudio
-      context_length: 16384
-      max_concurrency: 2
-      prefill_tokens_per_second: 120
-      decode_tokens_per_second: 30
-      supports_tools: true
-      supports_vision: false
-      supports_reasoning: true
-      models:
-        - local-small-model-id
-      model_map:
-        local-fast: local-small-model-id
-
-    # A protected node receives only this explicitly named credential. Inbound
-    # proxy Authorization and OPENAI_API_KEY are never forwarded automatically.
-    # - name: protected
-    #   base_url: http://protected-node.lan:8000/v1
-    #   api_key_env: PROTECTED_NODE_API_KEY
-    #   context_length: 65536
-    #   models: [private-model]
+  # External mode invariants:
+  # - do not configure fleet.nodes;
+  # - do not run `hermes fleet serve` or `hermes fleet discover`;
+  # - Hermes does not probe physical endpoints or track local inflight slots;
+  # - use semantic aliases such as auto/code, auto/review, and auto/finalize;
+  # - `hermes fleet status` reads auto-router health/models/admission state.
 
 agent:
   # auto selects lean <=32K, balanced through 128K, and full above 128K.
   context_profile: auto
 
   # Coding sessions use the coding toolset plus explicitly enabled MCP servers.
-  # This is the largest safe schema reduction already supported by Hermes.
+  # The reconciliation executor should still use an operator-approved allowlist.
   coding_context: focus
 
   # Retain batching guidance because fewer model round-trips matter even more on
@@ -118,22 +82,22 @@ plugins:
     - rtk-rewrite
     - cache-foundation
 
-# Add knowledge_graph when Neo4j is configured. It remains a single-select
-# external provider and should keep raw reasoning/tool capture disabled.
+# The reconciled AssistX deployment supplies durable memory and execution state.
+# Keep raw reasoning/tool capture disabled.
 memory:
   provider: knowledge_graph
 
 knowledge_graph:
   enabled: true
-  uri: bolt://127.0.0.1:7687
+  uri: bolt://neo4j:7687
   user: neo4j
-  database: neo4j
+  database: assistx_reconciliation
   capture_reasoning: false
   capture_tool_arguments: false
   capture_tool_results: false
 
 # Worktree isolation prevents concurrent coding agents from editing the same
-# checkout. Prefer ssh/docker terminal isolation when available.
+# checkout. The deployment should mount exactly one approved task worktree.
 worktree: true
 worktree_sync: true
 
@@ -143,4 +107,4 @@ terminal:
 
 # Smaller models benefit from a lower iteration ceiling and explicit delegation
 # budgets. Raise only after measuring successful completion behavior.
-max_concurrent_sessions: 2
+max_concurrent_sessions: 1
