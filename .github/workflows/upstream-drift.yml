@@ -1,0 +1,100 @@
+name: Upstream drift
+
+on:
+  schedule:
+    - cron: "17 13 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: upstream-drift
+  cancel-in-progress: true
+
+jobs:
+  report:
+    name: Report fork drift
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+
+      - name: Generate reports
+        id: drift
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/upstream_drift_report.py \
+            --base main \
+            --upstream upstream/main \
+            --fetch \
+            --json > upstream-drift.json
+          python scripts/upstream_drift_report.py \
+            --base main \
+            --upstream upstream/main \
+            --markdown > upstream-drift.md
+
+          behind="$(python -c 'import json; print(json.load(open("upstream-drift.json"))["behind"])')"
+          ahead="$(python -c 'import json; print(json.load(open("upstream-drift.json"))["ahead"])')"
+          echo "behind=${behind}" >> "$GITHUB_OUTPUT"
+          echo "ahead=${ahead}" >> "$GITHUB_OUTPUT"
+          cat upstream-drift.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Open or refresh drift issue
+        if: steps.drift.outputs.behind != '0'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_TITLE: "[upstream-drift] NousResearch/hermes-agent"
+        shell: bash
+        run: |
+          set -euo pipefail
+          issue_number="$(
+            gh issue list \
+              --repo "$GITHUB_REPOSITORY" \
+              --state open \
+              --limit 100 \
+              --json number,title \
+              --jq '.[] | select(.title == env.ISSUE_TITLE) | .number' \
+              | head -n 1
+          )"
+          if [[ -n "$issue_number" ]]; then
+            gh issue edit "$issue_number" \
+              --repo "$GITHUB_REPOSITORY" \
+              --body-file upstream-drift.md
+            gh issue comment "$issue_number" \
+              --repo "$GITHUB_REPOSITORY" \
+              --body "Weekly drift report refreshed by workflow run $GITHUB_RUN_ID."
+          else
+            gh issue create \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "$ISSUE_TITLE" \
+              --body-file upstream-drift.md
+          fi
+
+      - name: Close resolved drift issue
+        if: steps.drift.outputs.behind == '0'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_TITLE: "[upstream-drift] NousResearch/hermes-agent"
+        shell: bash
+        run: |
+          set -euo pipefail
+          issue_number="$(
+            gh issue list \
+              --repo "$GITHUB_REPOSITORY" \
+              --state open \
+              --limit 100 \
+              --json number,title \
+              --jq '.[] | select(.title == env.ISSUE_TITLE) | .number' \
+              | head -n 1
+          )"
+          if [[ -n "$issue_number" ]]; then
+            gh issue comment "$issue_number" \
+              --repo "$GITHUB_REPOSITORY" \
+              --body "Upstream drift is now zero; closing automatically."
+            gh issue close "$issue_number" --repo "$GITHUB_REPOSITORY"
+          fi
