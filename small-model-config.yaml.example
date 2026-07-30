@@ -1,14 +1,71 @@
 # Copy the relevant sections into $HERMES_HOME/config.yaml.
-# This template minimizes always-on context without removing tools or skills.
+# This template minimizes always-on context and routes local inference through
+# an explicit Headroom-aware fleet without removing tools or skills.
 
 model:
-  provider: lmstudio
-  default: local-model-id
-  base_url: http://127.0.0.1:1234/v1
+  provider: custom
+  default: local-coder
+  base_url: http://127.0.0.1:8765/v1
 
-  # Use the context actually configured on the inference server, including the
-  # output allowance. Do not copy the model-family theoretical maximum.
+  # Use a conservative context available across the nodes intended for the main
+  # agent. The fleet router separately rejects any node that cannot fit a
+  # specific request plus its requested output and safety margin.
   context_length: 32768
+
+fleet:
+  enabled: true
+  health_ttl_seconds: 30
+  default_max_output_tokens: 4096
+  max_attempts: 2
+
+  # Loopback is the safe default. A non-loopback bind must be explicitly enabled
+  # and should also set token_env to a dedicated inbound bearer token.
+  listen:
+    host: 127.0.0.1
+    port: 8765
+    allow_non_loopback: false
+    # token_env: HERMES_FLEET_LISTEN_TOKEN
+
+  # Only explicitly listed nodes are contacted. There are no built-in hostnames,
+  # tailnet names, subnet scans, or implicitly forwarded provider credentials.
+  nodes:
+    - name: primary-large
+      base_url: http://primary-large.lan:1234/v1
+      provider: lmstudio
+      context_length: 32768
+      max_concurrency: 1
+      prefill_tokens_per_second: 80
+      decode_tokens_per_second: 18
+      supports_tools: true
+      supports_vision: false
+      supports_reasoning: true
+      models:
+        - local-large-model-id
+      model_map:
+        local-coder: local-large-model-id
+
+    - name: fast-small
+      base_url: http://fast-small.lan:1234/v1
+      provider: lmstudio
+      context_length: 16384
+      max_concurrency: 2
+      prefill_tokens_per_second: 120
+      decode_tokens_per_second: 30
+      supports_tools: true
+      supports_vision: false
+      supports_reasoning: true
+      models:
+        - local-small-model-id
+      model_map:
+        local-fast: local-small-model-id
+
+    # A protected node receives only this explicitly named credential. Inbound
+    # proxy Authorization and OPENAI_API_KEY are never forwarded automatically.
+    # - name: protected
+    #   base_url: http://protected-node.lan:8000/v1
+    #   api_key_env: PROTECTED_NODE_API_KEY
+    #   context_length: 65536
+    #   models: [private-model]
 
 agent:
   # auto selects lean <=32K, balanced through 128K, and full above 128K.
@@ -57,6 +114,7 @@ compression:
 plugins:
   enabled:
     - small-model-context
+    - fleet-router
     - rtk-rewrite
     - cache-foundation
 
