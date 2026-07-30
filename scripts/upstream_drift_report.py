@@ -11,6 +11,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Sequence
+from urllib.parse import urlsplit, urlunsplit
 
 _DEFAULT_UPSTREAM_URL = "https://github.com/NousResearch/hermes-agent.git"
 
@@ -29,6 +30,23 @@ class Report:
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
+
+
+def _redact_url(value: str) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    if "://" not in raw:
+        return raw.split("@", 1)[1] if "@" in raw else raw
+    try:
+        parsed = urlsplit(raw)
+        host = parsed.hostname or ""
+        if ":" in host and not host.startswith("["):
+            host = f"[{host}]"
+        port = f":{parsed.port}" if parsed.port else ""
+        return urlunsplit((parsed.scheme, f"{host}{port}", parsed.path, "", ""))
+    except (TypeError, ValueError):
+        return "<redacted-url>"
 
 
 def _run_git(
@@ -68,7 +86,7 @@ def _ensure_upstream(root: Path, url: str, *, fetch: bool) -> None:
     elif current.stdout.strip() != url:
         raise RuntimeError(
             "existing upstream remote does not match the configured URL: "
-            f"{current.stdout.strip()}"
+            f"{_redact_url(current.stdout.strip())}"
         )
 
     if fetch:
