@@ -1,0 +1,88 @@
+# Copy the relevant sections into $HERMES_HOME/config.yaml.
+# This template minimizes always-on context without removing tools or skills.
+
+model:
+  provider: lmstudio
+  default: local-model-id
+  base_url: http://127.0.0.1:1234/v1
+
+  # Use the context actually configured on the inference server, including the
+  # output allowance. Do not copy the model-family theoretical maximum.
+  context_length: 32768
+
+agent:
+  # auto selects lean <=32K, balanced through 128K, and full above 128K.
+  context_profile: auto
+
+  # Coding sessions use the coding toolset plus explicitly enabled MCP servers.
+  # This is the largest safe schema reduction already supported by Hermes.
+  coding_context: focus
+
+  # Retain batching guidance because fewer model round-trips matter even more on
+  # slow local inference.
+  parallel_tool_call_guidance: true
+
+  # Keep completion discipline on unless the selected model already follows
+  # through reliably; disabling it saves prompt tokens but can increase stubs.
+  task_completion_guidance: true
+
+context_optimizer:
+  profile: auto
+  skills: auto
+  tools: auto
+
+  # Used only when the selected mode is compact.
+  tool_description_chars: 180
+  parameter_description_chars: 96
+  skill_description_chars: 120
+
+# For repositories without a concise .hermes.md/HERMES.md, bound the fallback
+# AGENTS.md/CLAUDE.md/.cursorrules injection. The omitted content remains
+# available through read_file when the current task needs it.
+context_file_max_chars: 6000
+
+compression:
+  enabled: true
+  protect_first_n: 0
+  protect_last_n: 16
+  min_tail_user_messages: 3
+  max_attempts: 4
+
+  # Rewriting past history invalidates the current provider prefix cache. Keep
+  # proactive pruning disabled until measured context pressure justifies it.
+  proactive_prune_tokens: 0
+  proactive_prune_min_result_chars: 8000
+  proactive_prune_min_reclaim_tokens: 4096
+
+plugins:
+  enabled:
+    - small-model-context
+    - rtk-rewrite
+    - cache-foundation
+
+# Add knowledge_graph when Neo4j is configured. It remains a single-select
+# external provider and should keep raw reasoning/tool capture disabled.
+memory:
+  provider: knowledge_graph
+
+knowledge_graph:
+  enabled: true
+  uri: bolt://127.0.0.1:7687
+  user: neo4j
+  database: neo4j
+  capture_reasoning: false
+  capture_tool_arguments: false
+  capture_tool_results: false
+
+# Worktree isolation prevents concurrent coding agents from editing the same
+# checkout. Prefer ssh/docker terminal isolation when available.
+worktree: true
+worktree_sync: true
+
+terminal:
+  backend: local
+  timeout: 180
+
+# Smaller models benefit from a lower iteration ceiling and explicit delegation
+# budgets. Raise only after measuring successful completion behavior.
+max_concurrent_sessions: 2
