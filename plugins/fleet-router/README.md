@@ -1,81 +1,88 @@
-# Hermes fleet router
+# Hermes fleet integration
 
-`fleet-router` exposes a stable local OpenAI-compatible endpoint and routes each
-request to the best explicitly configured inference node. It replaces the old
-in-process fleet implementation, which depended on personal host defaults and
-outdated provider internals.
+`fleet-router` has three explicit operating modes:
 
-The proxy keeps Hermes provider transports unchanged. Hermes talks to one local
-URL, while the proxy handles node health, model mapping, context headroom,
-concurrency pressure, latency, throughput hints, streaming, failover, and
-cache/session affinity.
+```yaml
+fleet:
+  mode: external  # external | standalone | disabled
+```
 
-## Safety defaults
+## External mode — AssistX/auto-router
 
-- No hosts, tailnets, ports, or machine names are built in.
-- Only nodes listed under `fleet.nodes` are contacted.
-- Public endpoints are rejected unless that individual node sets
-  `allow_remote: true`.
-- The proxy binds to `127.0.0.1` by default.
-- A non-loopback bind requires `fleet.listen.allow_non_loopback: true`.
-- Inbound `Authorization` is never forwarded upstream.
-- A node receives a bearer token only when it names a dedicated
-  `api_key_env` variable.
-- `OPENAI_API_KEY` and unrelated provider keys are never forwarded implicitly.
-- Cache identity headers may pass through so an inference server or cache-aware
-  controller can reuse exact prefixes.
+Use `external` for the reconciled fleet. Hermes is the executor, not the fleet
+router. AssistX/Neo4j owns durable runtime/model identity, access paths,
+inventory, capacity, assignments, claims, leases, health, and recovery.
+auto-router owns semantic policy routing, physical-runtime admission, LAN-first
+and Tailscale-fallback path selection, queueing, and inference telemetry.
 
-## Enable and inspect
+```yaml
+model:
+  provider: custom
+  default: auto/code
+  base_url: http://auto-router-reconciliation:8088/v1
+  context_length: 32768
+
+fleet:
+  mode: external
+  external:
+    base_url: http://auto-router-reconciliation:8088/v1
+    admin_url: http://auto-router-reconciliation:8088
+    api_key_env: AUTO_ROUTER_CLIENT_TOKEN
+    admin_token_env: AUTO_ROUTER_ADMIN_TOKEN
+    default_model: auto/code
+    strict_offline: true
+```
+
+External-mode invariants are enforced:
+
+- `fleet.nodes` is rejected;
+- Hermes does not probe physical endpoints;
+- Hermes does not track node health, inflight requests, or concurrency slots;
+- Hermes does not choose LAN/Tailscale paths or physical models;
+- `hermes fleet serve` and `hermes fleet discover` are forbidden;
+- `hermes fleet status` reads `/health`, `/v1/models`, and authenticated
+  `/admin/admission` from auto-router;
+- `hermes fleet route` explains the semantic `auto/*` intent only.
+
+Use aliases such as:
+
+- `auto/fast`
+- `auto/high-quality`
+- `auto/code`
+- `auto/review`
+- `auto/iterate`
+- `auto/finalize`
+- `auto/sophia`
+- `auto/local`
+- `auto/private`
+
+Task calls should continue to carry task/run, claim/fencing, priority, required
+capabilities, `local_only`, workflow-stage, session, and checkpoint metadata.
+Hermes cache-identity headers pass through its ordinary provider transport to
+auto-router.
+
+Administration:
 
 ```bash
 hermes plugins enable fleet-router
 hermes fleet doctor
-hermes fleet discover
 hermes fleet status --json
+hermes fleet route --model auto/review --tools --reasoning
 ```
 
-Explain routing without sending a request:
+## Standalone mode — Hermes-managed fleet
 
-```bash
-hermes fleet route \
-  --model local-coder \
-  --input-tokens 12000 \
-  --max-output-tokens 4000 \
-  --tools \
-  --reasoning
-```
-
-Run the proxy:
-
-```bash
-hermes fleet serve
-```
-
-The default endpoint is:
-
-```text
-http://127.0.0.1:8765/v1
-```
-
-Configure Hermes to use that endpoint while keeping the requested model as a
-stable fleet alias:
+Use `standalone` only when AssistX and auto-router are not deployed. This keeps
+the PR #10 Headroom proxy for independent Hermes installations.
 
 ```yaml
 model:
   provider: custom
   default: local-coder
   base_url: http://127.0.0.1:8765/v1
-  context_length: 32768
-```
 
-Use a conservative `model.context_length` for the main Hermes process. The
-router separately rejects nodes that cannot fit the estimated input, requested
-output, and a safety margin.
-
-## Configuration
-
-```yaml
 fleet:
+  mode: standalone
   enabled: true
   health_ttl_seconds: 30
   default_max_output_tokens: 4096
@@ -85,11 +92,10 @@ fleet:
     host: 127.0.0.1
     port: 8765
     allow_non_loopback: false
-    # token_env: HERMES_FLEET_LISTEN_TOKEN
 
   nodes:
-    - name: x1-370
-      base_url: http://x1-370.lan:1234/v1
+    - name: primary-large
+      base_url: http://primary-large.lan:1234/v1
       provider: lmstudio
       context_length: 32768
       max_concurrency: 1
@@ -98,76 +104,56 @@ fleet:
       supports_tools: true
       supports_vision: false
       supports_reasoning: true
-      models:
-        - qwen3.5-35b-a3b
+      models: [local-large-model-id]
       model_map:
-        local-coder: qwen3.5-35b-a3b
-
-    - name: macbook-air
-      base_url: http://macbook-air.lan:1234/v1
-      provider: lmstudio
-      context_length: 16384
-      max_concurrency: 2
-      prefill_tokens_per_second: 120
-      decode_tokens_per_second: 28
-      models:
-        - qwen3.5-2b
-      model_map:
-        local-fast: qwen3.5-2b
-
-    - name: protected-node
-      base_url: http://protected-node.lan:8000/v1
-      api_key_env: PROTECTED_NODE_API_KEY
-      context_length: 65536
-      max_concurrency: 1
-      models:
-        - private-model
+        local-coder: local-large-model-id
 ```
 
-Static `models` allow deterministic routing before or when `/v1/models` is
-unavailable. Successful probes replace the runtime catalog with the server's
-reported model IDs. `model_map` defines stable client-facing aliases without
-rewriting the Hermes conversation or model configuration.
+The standalone proxy owns its explicit node registry and supports bounded
+concurrent probes, aliases, capability/context eligibility, context-headroom
+scoring, throughput and latency hints, inflight pressure, session/checkpoint
+affinity, failover, streaming, and cache-header passthrough.
 
-Set `accept_unknown_models: true` only for a node that intentionally accepts
-arbitrary model IDs. The default is fail-closed.
+```bash
+hermes fleet discover
+hermes fleet status --json
+hermes fleet route --model local-coder --input-tokens 12000 --max-output-tokens 4000
+hermes fleet serve
+```
 
-## Route scoring
+Standalone safety defaults:
 
-A node must first pass hard eligibility checks:
+- no hosts, tailnets, ports, or machine names are built in;
+- only `fleet.nodes` entries are contacted;
+- public endpoints require `allow_remote: true` per node;
+- the proxy binds to `127.0.0.1` by default;
+- non-loopback bind requires `fleet.listen.allow_non_loopback: true`;
+- inbound `Authorization` is never forwarded;
+- node credentials come only from that node's named `api_key_env`;
+- unknown models are rejected unless `accept_unknown_models: true`.
 
-- healthy and recently probed;
-- requested model or explicit alias available;
-- tools, vision, and reasoning capabilities satisfied;
-- configured context length large enough for estimated input, requested output,
-  and safety margin.
-
-Eligible nodes are then ranked by:
-
-- remaining context headroom;
-- exact model match;
-- operator priority;
-- configured prefill and decode throughput;
-- measured latency exponential moving average;
-- current in-flight requests relative to concurrency;
-- session affinity;
-- cache-checkpoint affinity.
-
-The score is deterministic, and ties resolve by node name. `hermes fleet route`
-prints the ranked candidates and reasons.
-
-## Proxy endpoints
+Standalone proxy endpoints:
 
 - `GET /health`
 - `GET /fleet/status`
 - `GET /v1/models`
 - `POST /v1/chat/completions`
 
-Both normal JSON and streaming chat-completion responses are relayed. The
-response includes `X-Hermes-Fleet-Node` so operators can see which node served
-the request.
+See `standalone-fleet-config.yaml.example` for a complete standalone example.
 
-The current implementation intentionally does not scan an entire subnet,
-inspect Tailscale state, persist credentials, synchronize model files, or claim
-to move KV tensors between engines. Those require separate operator-controlled
-services and exact engine/model/quantization compatibility.
+## Disabled mode
+
+```yaml
+fleet:
+  mode: disabled
+```
+
+Hermes uses its ordinary configured provider directly. No fleet plugin routing
+or proxy is active.
+
+## Boundary
+
+The standalone router intentionally does not scan subnets, inspect Tailscale
+control-plane state, synchronize or load models, mutate runtime health, or move
+KV tensors. External mode delegates all fleet state and physical routing to
+AssistX/auto-router and never constructs the standalone `FleetRouter` object.
