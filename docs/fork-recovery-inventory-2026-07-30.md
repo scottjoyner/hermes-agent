@@ -20,11 +20,10 @@ Use it as evidence and design input. Do not merge or copy the branch wholesale.
 | Neo4j semantic/relational memory | `plugins/memory/knowledge_graph/` |
 | RTK command-output compression | `plugins/rtk-rewrite/` |
 | Cache identity, affinity, warmup, and telemetry | `plugins/cache-foundation/` plus `agent/cache_foundation.py` |
-| Small-model always-on context reduction | `plugins/small-model-context/` and root `.hermes.md` in the current PR |
+| Small-model always-on context reduction | `plugins/small-model-context/` and root `.hermes.md` in PR #10 |
+| Configurable local inference fleet and Headroom routing | `plugins/fleet-router/` in PR #10 |
 
-## Priority 1 — re-port, do not restore verbatim
-
-### Configurable inference fleet and Headroom router
+## Recovered in PR #10 — configurable fleet and Headroom router
 
 Historical source:
 
@@ -32,46 +31,66 @@ Historical source:
 backup/pre-upstream-reconcile-2026-07-29:agent/fleet.py
 ```
 
-Why it matters:
+The useful historical behavior was endpoint cataloging and routing requests to
+other local machines. The old implementation was not restored because:
 
-- discovers OpenAI-compatible and Ollama-style local endpoints;
-- catalogs available models;
-- routes a request to another machine;
-- directly supports the goal of using several heterogeneous local nodes.
+- its fallback tailnet and seed hosts contained personal machine defaults;
+- discovery probed hosts and ports sequentially;
+- routing was primarily model-name match plus latency;
+- node capabilities were mostly inferred rather than measured;
+- API-key forwarding included broad environment-variable fallbacks;
+- it patched an in-process provider path that no longer matches current Hermes
+  transports, middleware, cache identity, or configuration policy.
 
-Why the old implementation cannot return unchanged:
+The replacement is a standalone OpenAI-compatible local proxy. Hermes keeps one
+stable provider endpoint while the proxy owns the heterogeneous node registry.
 
-- its fallback tailnet and seed hosts contain personal machine defaults;
-- discovery probes hosts and ports sequentially;
-- routing is primarily model-name match plus latency;
-- node capabilities are mostly inferred rather than measured;
-- configuration and API-key forwarding include environment-variable surfaces
-  that conflict with current repository policy;
-- it does not integrate current provider transports, middleware, context
-  budgets, cache manifests, or session affinity.
+Implemented contract:
 
-Required replacement contract:
+1. Nodes are listed explicitly in `config.yaml`; no host, tailnet, subnet, or
+   port scanning occurs implicitly.
+2. Public endpoints are rejected unless the named node sets
+   `allow_remote: true`.
+3. Health and model-catalog probes execute concurrently with bounded workers and
+   short per-node timeouts.
+4. Hard routing constraints cover model or alias availability, tools, vision,
+   reasoning, and configured context capacity.
+5. Route scoring covers context headroom, exact model match, operator priority,
+   configured prefill/decode throughput, measured latency EMA, current in-flight
+   concurrency, session affinity, and cache-checkpoint affinity.
+6. Client-facing model aliases map to different upstream model IDs without
+   rewriting the Hermes conversation.
+7. The proxy supports normal and streaming `/v1/chat/completions` responses and
+   exposes `/v1/models`, `/health`, and `/fleet/status`.
+8. A failed connection or upstream 5xx can retry another eligible node within a
+   bounded attempt count. Concrete 4xx responses are relayed immediately rather
+   than duplicating work.
+9. Inbound authorization is never forwarded. Each protected node may name one
+   dedicated `api_key_env`; unrelated provider keys are ignored.
+10. Cache identity headers pass through, allowing the router to keep session and
+    checkpoint affinity while compatible inference servers consume the exact
+    cache manifest.
+11. The proxy binds to loopback by default. Non-loopback binding requires an
+    explicit configuration gate and may require a dedicated inbound token.
+12. `hermes fleet status`, `discover`, `doctor`, `route`, and `serve` provide
+    operator inspection without adding model-visible tools or prompt overhead.
 
-1. Explicit node registry in `config.yaml`; optional discovery may add candidates
-   but never invent personal hosts.
-2. Concurrent bounded health/model probes with backoff and durable observations.
-3. Per-node model, quantization, tokenizer, chat-template, context, throughput,
-   queue depth, cold-load, vision, reasoning, and cache-checkpoint metadata.
-4. Route scoring constrained by task adequacy first, then context fit, cache
-   affinity, queue/prefill/cold-load cost, throughput, latency, and monetary cost.
-5. No credential forwarding unless explicitly enabled for a named node.
-6. Session stickiness by default; migration only with a compatible replay or
-   verified checkpoint identity.
-7. Public provider/router interface rather than patches throughout the agent
-   loop.
-8. Headroom transforms only the volatile conversation zone and reports exactly
-   what it removed or summarized.
-9. Deterministic fallback to the configured primary endpoint when fleet state is
-   unavailable.
-10. Benchmarks that measure quality, time-to-first-token, tokens/second, prompt
-    processing, cache hits, and completion rate on small models.
+Intentionally not claimed or implemented yet:
 
-This should be the next major implementation PR after context optimization.
+- exact tokenizer, chat-template, engine-build, quantization, and KV-layout
+  compatibility discovery;
+- transfer of KV tensors between independent inference engines;
+- automatic model download, synchronization, loading, or eviction;
+- subnet or Tailscale control-plane discovery;
+- durable multi-process health and throughput observations;
+- tokenizer-exact request sizing; the first implementation uses a conservative
+  tokenizer-independent estimate and configured context limits;
+- monetary-cost routing or quality benchmarking;
+- Headroom transformations that summarize or remove conversation content. The
+  router currently selects only nodes that can fit the request as sent.
+
+Those are follow-on improvements to the current public proxy boundary, not a
+reason to restore the historical core file.
 
 ## Priority 2 — inspect and salvage narrowly
 
@@ -140,7 +159,8 @@ For each candidate capability:
 2. State the user-visible behavior worth preserving.
 3. Trace the equivalent current subsystem and public extension interfaces.
 4. Identify security, privacy, caching, and configuration-policy differences.
-5. Build one focused branch from current `main`.
+5. Build one focused branch from current `main` or extend an explicitly approved
+   in-flight PR when the capabilities share one deployment boundary.
 6. Add behavior-contract and integration tests.
 7. Run the complete repository CI matrix before merge.
 8. Record which historical behavior was intentionally not restored.
