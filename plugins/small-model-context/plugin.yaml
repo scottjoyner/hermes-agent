@@ -1,0 +1,7 @@
+name: small-model-context
+version: "0.1.0"
+description: "Deterministically compact always-on skill and tool-schema context for smaller local models while preserving tool names, parameters, and cache stability. Adds `hermes context-opt`."
+author: "Scott Joyner"
+kind: standalone
+middleware:
+  - llm_request
