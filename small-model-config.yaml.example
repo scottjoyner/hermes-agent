@@ -1,0 +1,110 @@
+# Copy the relevant sections into $HERMES_HOME/config.yaml.
+# This is the recommended reconciled deployment: Hermes is an executor and sees
+# only auto-router. AssistX/Neo4j owns fleet identity, inventory, capacity,
+# assignments, claims, leases, access paths, and recovery.
+
+model:
+  provider: custom
+  default: auto/code
+  base_url: http://auto-router-reconciliation:8088/v1
+
+  # This value sizes Hermes prompt/context behavior only. auto-router and AssistX
+  # independently enforce the admitted model/runtime context window.
+  context_length: 32768
+
+fleet:
+  mode: external  # external | standalone | disabled
+
+  external:
+    base_url: http://auto-router-reconciliation:8088/v1
+    admin_url: http://auto-router-reconciliation:8088
+    api_key_env: AUTO_ROUTER_CLIENT_TOKEN
+    admin_token_env: AUTO_ROUTER_ADMIN_TOKEN
+    default_model: auto/code
+    strict_offline: true
+    timeout_seconds: 10
+
+  # External mode invariants:
+  # - do not configure fleet.nodes;
+  # - do not run `hermes fleet serve` or `hermes fleet discover`;
+  # - Hermes does not probe physical endpoints or track local inflight slots;
+  # - use semantic aliases such as auto/code, auto/review, and auto/finalize;
+  # - `hermes fleet status` reads auto-router health/models/admission state.
+
+agent:
+  # auto selects lean <=32K, balanced through 128K, and full above 128K.
+  context_profile: auto
+
+  # Coding sessions use the coding toolset plus explicitly enabled MCP servers.
+  # The reconciliation executor should still use an operator-approved allowlist.
+  coding_context: focus
+
+  # Retain batching guidance because fewer model round-trips matter even more on
+  # slow local inference.
+  parallel_tool_call_guidance: true
+
+  # Keep completion discipline on unless the selected model already follows
+  # through reliably; disabling it saves prompt tokens but can increase stubs.
+  task_completion_guidance: true
+
+context_optimizer:
+  profile: auto
+  skills: auto
+  tools: auto
+
+  # Used only when the selected mode is compact.
+  tool_description_chars: 180
+  parameter_description_chars: 96
+  skill_description_chars: 120
+
+# For repositories without a concise .hermes.md/HERMES.md, bound the fallback
+# AGENTS.md/CLAUDE.md/.cursorrules injection. The omitted content remains
+# available through read_file when the current task needs it.
+context_file_max_chars: 6000
+
+compression:
+  enabled: true
+  protect_first_n: 0
+  protect_last_n: 16
+  min_tail_user_messages: 3
+  max_attempts: 4
+
+  # Rewriting past history invalidates the current provider prefix cache. Keep
+  # proactive pruning disabled until measured context pressure justifies it.
+  proactive_prune_tokens: 0
+  proactive_prune_min_result_chars: 8000
+  proactive_prune_min_reclaim_tokens: 4096
+
+plugins:
+  enabled:
+    - small-model-context
+    - fleet-router
+    - rtk-rewrite
+    - cache-foundation
+
+# The reconciled AssistX deployment supplies durable memory and execution state.
+# Keep raw reasoning/tool capture disabled.
+memory:
+  provider: knowledge_graph
+
+knowledge_graph:
+  enabled: true
+  uri: bolt://neo4j:7687
+  user: neo4j
+  database: assistx_reconciliation
+  capture_reasoning: false
+  capture_tool_arguments: false
+  capture_tool_results: false
+
+# Worktree isolation prevents concurrent coding agents from editing the same
+# checkout. The deployment should mount exactly one approved task worktree.
+worktree: true
+worktree_sync: true
+
+terminal:
+  backend: local
+  timeout: 180
+
+# Smaller models benefit from a lower iteration ceiling and explicit delegation
+# budgets. Raise only after measuring successful completion behavior.
+max_concurrent_sessions: 1
