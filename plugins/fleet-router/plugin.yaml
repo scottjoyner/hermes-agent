@@ -1,0 +1,7 @@
+name: fleet-router
+version: "0.1.0"
+description: "Headroom-aware OpenAI-compatible proxy for routing Hermes requests across an explicitly configured local model fleet. Adds `hermes fleet`."
+author: "Scott Joyner"
+license: MIT
+hermes_version: ">=0.19.0,<1"
+kind: standalone
