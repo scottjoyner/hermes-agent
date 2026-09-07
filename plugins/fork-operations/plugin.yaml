@@ -1,0 +1,5 @@
+name: fork-operations
+version: "0.1.0"
+description: "Operational diagnostics for the scottjoyner Hermes fork: upstream drift, remote topology, custom integration readiness, and configuration safety checks. Adds `hermes fork-doctor` and `hermes fork-drift`."
+author: "Scott Joyner"
+kind: standalone
