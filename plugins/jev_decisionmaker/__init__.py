@@ -36,6 +36,7 @@ logger = logging.getLogger("jev_decisionmaker")
 
 JEV_SYSTEM_PROMPT = (
     "You are a JEV judge. Evaluate the response against the goal. "
+    "Be strict: if the response is incomplete, wrong, or vague, say retry. "
     "Return ONLY this exact JSON, no markdown, no thinking: "
     "{\"verdict\":\"accept\"|\"retry\"|\"delegate\",\"score\":0.0-1.0,\"reason\":\"<10 words>\",\"suggested_model\":\"<model>\"}."
 )
@@ -43,18 +44,23 @@ JEV_SYSTEM_PROMPT = (
 DEFAULT_CONFIG = {
     "enabled": False,
     "judge": {
-        "model": "local/destroyer-1b",
+        "model": "local/destroyer-ornith",
         "provider": "custom",
-        "base_url": "http://destroyer.tailcb8954.ts.net:1238/v1",
-        "max_tokens": 128,
+        "base_url": "http://destroyer.tailcb8954.ts.net:1236/v1",
+        "max_tokens": 256,
         "temperature": 0.0,
     },
     "generator": {
-        "model": "local/destroyer-36b",
+        "model": "local/destroyer-ornith",
         "provider": "custom",
-        "base_url": "http://destroyer.tailcb8954.ts.net:1235/v1",
+        "base_url": "http://destroyer.tailcb8954.ts.net:1236/v1",
     },
-    "delegation_threshold": 0.5,
+    "fallback": {
+        "model": "local/destroyer-ornith",
+        "provider": "custom",
+        "base_url": "http://destroyer.tailcb8954.ts.net:1236/v1",
+    },
+    "delegation_threshold": 0.7,
     "max_retries": 2,
     "swap_on_delegation": True,
     "verbose": False,
