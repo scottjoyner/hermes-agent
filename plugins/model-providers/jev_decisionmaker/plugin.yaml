@@ -1,0 +1,6 @@
+name: jev-decisionmaker
+kind: provider
+version: "0.1.0"
+description: JEV (Judge-Evaluate-Verify) decisionmaker — fast judge model routes between generator models
+author: destroyer
+license: MIT
