@@ -613,6 +613,7 @@ def init_agent(
         else agent.provider
     )
     agent._credential_pool = credential_pool
+    agent._jev_goal = ""
     agent.acp_command = acp_command or command
     agent.acp_args = list(acp_args or args or [])
     if api_mode in {"chat_completions", "codex_responses", "anthropic_messages", "bedrock_converse", "codex_app_server"}:

@@ -5690,7 +5690,33 @@ def run_conversation(
                 }
             elif hasattr(agent, "_codex_incomplete_retries"):
                 agent._codex_incomplete_retries = 0
-            
+
+            # ── JEV Decisionmaker ──
+            # Judge evaluates the assistant's output and decides:
+            # accept → pass through, retry → re-prompt same model,
+            # delegate → switch to a different model.
+            # Fail-open: judge errors never block progress.
+            _jev_verdict = None
+            try:
+                from plugins.jev_decisionmaker import JEVDecisionmaker as _JEV
+                _jev = _JEV({})
+                if _jev.enabled and assistant_message and hasattr(assistant_message, "content"):
+                    _response_text = getattr(assistant_message, "content", "") or ""
+                    _goal = str(user_message)[:500] if user_message else "general task"
+                    _jev_verdict = _jev.evaluate(goal=_goal, response=_response_text)
+                    if _jev_verdict and _jev_verdict.get("verdict") == "retry":
+                        if _jev.should_retry(_jev_verdict):
+                            _retry.restart_with_redirected_messages = True
+                            continue
+                    if _jev_verdict and _jev_verdict.get("verdict") == "delegate":
+                        _delegate_model = _jev.delegate_model(_jev_verdict)
+                        if _delegate_model:
+                            agent.model = _delegate_model
+                            agent._model_changed_this_turn = True
+            except Exception as _jev_err:
+                logger.debug("jev: judge error: %s", _jev_err)
+                _jev_verdict = None
+
             # Check for tool calls
             if assistant_message.tool_calls:
                 if not agent.quiet_mode:
