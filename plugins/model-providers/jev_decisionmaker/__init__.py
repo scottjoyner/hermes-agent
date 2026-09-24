@@ -221,7 +221,7 @@ class JEVProviderProfile(ProviderProfile):
         return {}, {}
 
     def fetch_models(self, **ctx):
-        return ["local/destroyer-1b", "local/destroyer-36b"]
+        return ["local/destroyer-1b", "local/destroyer-ornith", "local/qwen3-nano"]
 
 
 jev_profile = JEVProviderProfile(
