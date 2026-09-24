@@ -44,16 +44,16 @@ JEV_SYSTEM_PROMPT = (
 DEFAULT_CONFIG = {
     "enabled": False,
     "judge": {
-        "model": "local/destroyer-1b",
+        "model": "local/destroyer-ornith",
         "provider": "custom",
-        "base_url": "http://destroyer.tailcb8954.ts.net:1238/v1",
-        "max_tokens": 128,
+        "base_url": "http://destroyer.tailcb8954.ts.net:1236/v1",
+        "max_tokens": 256,
         "temperature": 0.0,
     },
     "generator": {
-        "model": "local/destroyer-4b",
+        "model": "local/destroyer-ornith",
         "provider": "custom",
-        "base_url": "http://destroyer.tailcb8954.ts.net:1238/v1",
+        "base_url": "http://destroyer.tailcb8954.ts.net:1236/v1",
     },
     "fallback": {
         "model": "local/destroyer-ornith",
