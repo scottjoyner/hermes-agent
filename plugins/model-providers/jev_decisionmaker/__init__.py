@@ -51,9 +51,14 @@ DEFAULT_CONFIG = {
         "temperature": 0.0,
     },
     "generator": {
-        "model": "local/destroyer-36b",
+        "model": "local/destroyer-4b",
         "provider": "custom",
-        "base_url": "http://destroyer.tailcb8954.ts.net:1235/v1",
+        "base_url": "http://destroyer.tailcb8954.ts.net:1238/v1",
+    },
+    "fallback": {
+        "model": "local/destroyer-ornith",
+        "provider": "custom",
+        "base_url": "http://destroyer.tailcb8954.ts.net:1236/v1",
     },
     "delegation_threshold": 0.7,
     "max_retries": 2,
@@ -221,7 +226,7 @@ class JEVProviderProfile(ProviderProfile):
         return {}, {}
 
     def fetch_models(self, **ctx):
-        return ["local/destroyer-1b", "local/destroyer-ornith", "local/qwen3-nano"]
+        return ["local/destroyer-1b", "local/destroyer-ornith", "local/destroyer-4b"]
 
 
 jev_profile = JEVProviderProfile(
