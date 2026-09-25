@@ -26,6 +26,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
 import urllib.request
 from typing import Any
 
@@ -90,7 +91,7 @@ def _chat_completion(base_url: str, messages: list, model: str, max_tokens: int,
         data=payload,
         headers={"Content-Type": "application/json"},
     )
-    with urllib.request.urlopen(req, timeout=30) as resp:
+    with urllib.request.urlopen(req, timeout=60) as resp:
         data = json.loads(resp.read().decode())
     msg = data["choices"][0]["message"]
     return msg.get("content", "") or msg.get("reasoning_content", "") or ""
@@ -130,18 +131,21 @@ class JEVDecisionmaker:
             {"role": "user", "content": user_prompt},
         ]
 
-        try:
-            text = _chat_completion(
-                base_url=self._judge_cfg["base_url"],
-                messages=messages,
-                model=self._judge_cfg["model"],
-                max_tokens=self._judge_cfg.get("max_tokens", 256),
-                temperature=self._judge_cfg.get("temperature", 0.0),
-            )
-            return self._parse_verdict(text)
-        except Exception as exc:
-            logger.warning("jev judge call failed: %s", exc)
-            return {"verdict": "accept", "score": 1.0, "reason": f"judge error: {exc}", "suggested_model": None}
+        for attempt in range(3):
+            try:
+                text = _chat_completion(
+                    base_url=self._judge_cfg["base_url"],
+                    messages=messages,
+                    model=self._judge_cfg["model"],
+                    max_tokens=self._judge_cfg.get("max_tokens", 256),
+                    temperature=self._judge_cfg.get("temperature", 0.0),
+                )
+                return self._parse_verdict(text)
+            except Exception as exc:
+                logger.warning("jev judge call failed (attempt %d): %s", attempt + 1, exc)
+                if attempt == 2:
+                    return {"verdict": "accept", "score": 1.0, "reason": f"judge error: {exc}", "suggested_model": None}
+                time.sleep(2)
 
 def _build_prompt(self, goal: str, response: str, context: str | None) -> str:
     parts = [f"GOAL: {goal}", f"RESPONSE: {response}"]
