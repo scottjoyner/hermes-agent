@@ -36,7 +36,7 @@ logger = logging.getLogger("jev_decisionmaker")
 
 JEV_SYSTEM_PROMPT = (
     "You are a JEV judge. Evaluate the response against the goal. "
-    "Be strict: if the response is incomplete, wrong, or vague, say retry. "
+    "Be reasonable: accept if the response addresses the goal, even if incomplete. "
     "Return ONLY this exact JSON, no markdown, no thinking: "
     "{\"verdict\":\"accept\"|\"retry\"|\"delegate\",\"score\":0.0-1.0,\"reason\":\"<10 words>\",\"suggested_model\":\"<model>\"}."
 )
@@ -44,9 +44,9 @@ JEV_SYSTEM_PROMPT = (
 DEFAULT_CONFIG = {
     "enabled": False,
     "judge": {
-        "model": "local/destroyer-ornith",
+        "model": "k2-1b",
         "provider": "custom",
-        "base_url": "http://destroyer.tailcb8954.ts.net:1236/v1",
+        "base_url": "http://127.0.0.1:1238/v1",
         "max_tokens": 256,
         "temperature": 0.0,
     },
