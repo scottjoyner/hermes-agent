@@ -35,10 +35,8 @@ from providers.base import ProviderProfile
 logger = logging.getLogger("jev_decisionmaker")
 
 JEV_SYSTEM_PROMPT = (
-    "You are a JEV judge. Evaluate the response against the goal. "
-    "Be reasonable: accept if the response addresses the goal, even if incomplete. "
-    "Return ONLY this exact JSON, no markdown, no thinking: "
-    "{\"verdict\":\"accept\"|\"retry\"|\"delegate\",\"score\":0.0-1.0,\"reason\":\"<10 words>\",\"suggested_model\":\"<model>\"}."
+    "Judge response vs goal. Return JSON only: "
+    "{\"verdict\":\"accept\"|\"retry\",\"score\":0-1,\"reason\":\"<5 words\"}."
 )
 
 DEFAULT_CONFIG = {
@@ -145,15 +143,11 @@ class JEVDecisionmaker:
             logger.warning("jev judge call failed: %s", exc)
             return {"verdict": "accept", "score": 1.0, "reason": f"judge error: {exc}", "suggested_model": None}
 
-    def _build_prompt(self, goal: str, response: str, context: str | None) -> str:
-        parts = [
-            f"GOAL: {goal}",
-            f"RESPONSE: {response}",
-            "Return ONLY JSON: {\"verdict\":\"accept\"|\"retry\"|\"delegate\",\"score\":0.0-1.0,\"reason\":\"<10 words\",\"suggested_model\":\"<model>\"}",
-        ]
-        if context:
-            parts.append(f"CONTEXT: {context}")
-        return "\n".join(parts)
+def _build_prompt(self, goal: str, response: str, context: str | None) -> str:
+    parts = [f"GOAL: {goal}", f"RESPONSE: {response}"]
+    if context:
+        parts.append(f"CONTEXT: {context}")
+    return "\n".join(parts)
 
     def _parse_verdict(self, text: str) -> dict[str, Any]:
         # Extract first JSON block from prose
