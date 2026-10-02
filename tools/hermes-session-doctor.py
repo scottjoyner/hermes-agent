@@ -12,7 +12,15 @@ import os
 import shutil
 import sqlite3
 import subprocess
+import sys
 from pathlib import Path
+
+
+# The installed wrapper is executed from arbitrary working directories. Keep
+# imports bound to this Hermes checkout rather than relying on cwd/PYTHONPATH.
+HERMES_ROOT = Path(__file__).resolve().parents[1]
+if str(HERMES_ROOT) not in sys.path:
+    sys.path.insert(0, str(HERMES_ROOT))
 
 
 def command_version() -> tuple[bool, str]:

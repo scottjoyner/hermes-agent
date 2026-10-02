@@ -5652,6 +5652,15 @@ def resolve_provider_client(
         return None, None
 
     pconfig = PROVIDER_REGISTRY.get(provider)
+    if (
+        provider == "opencode-zen"
+        and str(model or "").strip().lower().endswith("-free")
+    ):
+        final_model = _normalize_resolved_model(model, provider)
+        raw_base_url = (explicit_base_url or "https://opencode.ai/zen/v1").strip().rstrip("/")
+        client = _create_openai_client(api_key="", base_url=_to_openai_base_url(raw_base_url))
+        return (_to_async_client(client, final_model, is_vision=is_vision) if async_mode
+                else (client, final_model))
     if pconfig is None:
         # Demoted from logger.warning to debug; dedup keyed by provider name
         # so the first occurrence surfaces but repeated retries stay silent.

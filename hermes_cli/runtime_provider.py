@@ -2146,6 +2146,19 @@ def resolve_runtime_provider(
             runtime["guardrail_config"] = guardrail_config
         return runtime
 
+    # OpenCode Zen's free catalog is intentionally callable without a key,
+    # matching the local OpenCode CLI contract. Keep this model-scoped: paid
+    # and non-free models must still resolve a real Zen credential.
+    if provider == "opencode-zen" and str(target_model or "").strip().lower().endswith("-free"):
+        return {
+            "provider": provider,
+            "api_mode": "chat_completions",
+            "base_url": explicit_base_url or "https://opencode.ai/zen/v1",
+            "api_key": "",
+            "source": "opencode-cli-anonymous-free",
+            "requested_provider": requested_provider,
+        }
+
     # API-key providers (z.ai/GLM, Kimi, MiniMax, MiniMax-CN)
     pconfig = PROVIDER_REGISTRY.get(provider)
     if pconfig and pconfig.auth_type == "api_key":
