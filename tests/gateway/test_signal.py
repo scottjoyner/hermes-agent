@@ -2492,11 +2492,9 @@ class TestSignalSyncMessageHandling:
         assert 3000000000 not in adapter._recent_sent_timestamps
 
     @pytest.mark.asyncio
-    async def test_group_sync_sent_promoted_to_inbound(self, monkeypatch):
-        """User sends a message in a group from their primary phone; the
-        linked device receives it as a sync-sent with destination=None and
-        a groupInfo block. It must be treated as inbound so the agent can
-        respond in groups when the user is the only human participant."""
+    async def test_group_sync_sent_is_silently_dropped(self, monkeypatch):
+        """Signal groups are never dispatched, even when legacy group
+        allowlists or self-chat sync delivery are configured."""
         adapter = _make_signal_adapter(
             monkeypatch, account="+155****4567", group_allowed="abc123=="
         )
@@ -2527,9 +2525,7 @@ class TestSignalSyncMessageHandling:
             }
         })
 
-        assert "event" in captured, "Group sync-sent must reach handle_message"
-        assert captured["event"].text == "ping the group"
-        assert captured["event"].source.chat_id == "group:abc123=="
+        assert "event" not in captured, "Signal group messages must not reach handle_message"
 
     @pytest.mark.asyncio
     async def test_group_sync_sent_echo_of_own_reply_is_suppressed(self, monkeypatch):

@@ -596,22 +596,16 @@ class SignalAdapter(BasePlatformAdapter):
         group_id = group_info.get("groupId") if group_info else None
         is_group = bool(group_id)
 
-        # Group message filtering — derived from SIGNAL_GROUP_ALLOWED_USERS:
-        # - No env var set → groups disabled (default safe behavior)
-        # - Env var set with group IDs → only those groups allowed
-        # - Env var set with "*" → all groups allowed
-        # DM auth is fully handled by run.py (_is_user_authorized)
+        # Signal groups are permanently non-agent channels. Do not admit group
+        # traffic even when legacy allowlists or mention settings are present.
+        # Direct messages continue below unchanged.
         if is_group:
-            if not self.group_allow_from:
-                logger.debug("Signal: ignoring group message (no SIGNAL_GROUP_ALLOWED_USERS)")
-                return
-            if "*" not in self.group_allow_from and group_id not in self.group_allow_from:
-                logger.debug("Signal: group %s not in allowlist", group_id[:8] if group_id else "?")
-                return
+            logger.debug("Signal: ignoring group message (group agent replies disabled)")
+            return
 
         # Build chat info
-        chat_id = sender if not is_group else f"group:{group_id}"
-        chat_type = "group" if is_group else "dm"
+        chat_id = sender
+        chat_type = "dm"
 
         # Extract text and render mentions
         text = data_message.get("message", "")
