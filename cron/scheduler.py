@@ -1447,6 +1447,97 @@ def _is_channel_dm_topic(
     return is_channel
 
 
+
+def _try_kipnerter_notification_primary(
+    job: dict,
+    content: str,
+    target: dict,
+    user_cfg: Optional[dict],
+    media_files: list,
+) -> Optional[bool]:
+    """Try Kipnerter push before Signal for operator-facing cron notifications.
+
+    Returns ``True`` when Kipnerter accepted the notification, ``False`` when
+    Kipnerter was configured but failed (caller should fall back to Signal), and
+    ``None`` when this target is not eligible and the normal delivery path should
+    run unchanged.
+
+    This is intentionally scoped to Signal *self* targets. Signal remains the
+    transport for real Signal conversations/groups; only note-to-self style cron
+    notifications are promoted to Kipnerter push.
+    """
+    cron_cfg = (user_cfg or {}).get("cron", {}) if isinstance(user_cfg, dict) else {}
+    notify_cfg = cron_cfg.get("notification_delivery", {}) if isinstance(cron_cfg, dict) else {}
+    if not isinstance(notify_cfg, dict):
+        return None
+    if str(notify_cfg.get("primary", "")).strip().lower() != "kipnerter":
+        return None
+    if str(target.get("platform", "")).strip().lower() != "signal":
+        return None
+    # Kipnerter's current relay contract is text-only. Preserve Signal for jobs
+    # carrying MEDIA attachments rather than silently dropping them.
+    if media_files:
+        return None
+
+    if bool(notify_cfg.get("only_self", True)):
+        self_chat = os.getenv("SIGNAL_ACCOUNT", "").strip() or _get_home_target_chat_id("signal").strip()
+        if not self_chat or str(target.get("chat_id", "")) != self_chat:
+            return None
+
+    relay_url = str(
+        notify_cfg.get("relay_url", "https://xwing.tailcb8954.ts.net:8444/v1/signals")
+    ).strip()
+    token_file = os.path.expandvars(os.path.expanduser(str(
+        notify_cfg.get("token_file", "/home/scott/.config/fleet/signal-relay.token")
+    )))
+    try:
+        timeout = float(notify_cfg.get("timeout_seconds", 8))
+    except (TypeError, ValueError):
+        timeout = 8.0
+    try:
+        max_body_chars = int(notify_cfg.get("max_body_chars", 2800))
+    except (TypeError, ValueError):
+        max_body_chars = 2800
+    max_body_chars = max(256, min(max_body_chars, 12000))
+
+    title = str(job.get("name") or job.get("id") or "Hermes notification").strip()
+    body = str(content or "").strip()
+    if len(body) > max_body_chars:
+        body = body[: max_body_chars - 1].rstrip() + "…"
+
+    try:
+        token = Path(token_file).read_text(encoding="utf-8").strip()
+        if not token:
+            raise RuntimeError("Kipnerter relay token file is empty")
+        payload = json.dumps({
+            "title": title,
+            "body": body,
+            "source": str(notify_cfg.get("source", "hermes-cron")),
+            "category": str(notify_cfg.get("category", "hermes-cron")),
+            "priority": str(notify_cfg.get("priority", "normal")),
+        }).encode("utf-8")
+        from urllib.request import Request, urlopen
+        request = Request(
+            relay_url,
+            data=payload,
+            headers={
+                "Content-Type": "application/json",
+                "X-Kipnerter-Producer-Token": token,
+            },
+            method="POST",
+        )
+        with urlopen(request, timeout=timeout) as response:
+            status = int(getattr(response, "status", response.getcode()))
+        if 200 <= status < 300:
+            return True
+        raise RuntimeError(f"Kipnerter relay returned HTTP {status}")
+    except Exception as exc:
+        logger.warning(
+            "Job '%s': Kipnerter primary notification failed (%s); falling back to Signal",
+            job.get("id", "?"), exc,
+        )
+        return False
+
 def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Optional[str]:
     """
     Deliver job output to the configured target(s) (origin chat, specific platform, etc.).
@@ -1563,6 +1654,19 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         # Pass the origin's user_id so a per-user-isolated group chat resolves to
         # the exact member who scheduled the job — parity with send_message.
         origin_user_id = origin.get("user_id") if mirror_this_target else None
+
+        # Operator-facing Signal cron notifications prefer the Kipnerter iOS
+        # push relay. A failed relay attempt deliberately falls through to the
+        # existing Signal path, preserving Signal CLI as the fallback transport.
+        kipnerter_result = _try_kipnerter_notification_primary(
+            job, content, target, user_cfg, media_files
+        )
+        if kipnerter_result is True:
+            logger.info(
+                "Job '%s': delivered operator notification via Kipnerter push (Signal fallback not needed)",
+                job.get("id", "?"),
+            )
+            continue
 
         # Built-in names resolve to their enum member; plugin platform names
         # create dynamic members via Platform._missing_().

@@ -1130,6 +1130,103 @@ class TestDeliverResultWrapping:
         assert send_mock.call_args.kwargs["thread_id"] == "17585"
 
 
+class TestKipnerterPrimarySignalFallback:
+    """Operator cron notifications prefer Kipnerter push, with Signal as fallback."""
+
+    @staticmethod
+    def _notification_cfg(token_file):
+        return {
+            "cron": {
+                "notification_delivery": {
+                    "primary": "kipnerter",
+                    "fallback": "signal",
+                    "only_self": True,
+                    "relay_url": "https://relay.example/v1/signals",
+                    "token_file": str(token_file),
+                    "timeout_seconds": 2,
+                }
+            }
+        }
+
+    @staticmethod
+    def _gateway_cfg():
+        from gateway.config import Platform
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        cfg = MagicMock()
+        cfg.platforms = {Platform.SIGNAL: pconfig}
+        return cfg
+
+    def test_self_signal_cron_uses_kipnerter_and_skips_signal(self, tmp_path, monkeypatch):
+        token_file = tmp_path / "relay.token"
+        token_file.write_text("secret-token\n")
+        monkeypatch.setenv("SIGNAL_ACCOUNT", "+15550000001")
+
+        response = MagicMock()
+        response.status = 202
+        response.getcode.return_value = 202
+        response.__enter__.return_value = response
+
+        job = {
+            "id": "weather",
+            "name": "Morning weather",
+            "deliver": "origin",
+            "origin": {"platform": "signal", "chat_id": "+15550000001"},
+        }
+        with patch("cron.scheduler.load_config", return_value=self._notification_cfg(token_file)), \
+             patch("gateway.config.load_gateway_config", return_value=self._gateway_cfg()), \
+             patch("urllib.request.urlopen", return_value=response) as urlopen_mock, \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as signal_send:
+            assert _deliver_result(job, "Clear and mild.") is None
+
+        signal_send.assert_not_called()
+        request = urlopen_mock.call_args.args[0]
+        payload = json.loads(request.data.decode("utf-8"))
+        assert payload["title"] == "Morning weather"
+        assert payload["body"] == "Clear and mild."
+        assert request.get_header("X-kipnerter-producer-token") == "secret-token"
+
+    def test_kipnerter_failure_falls_back_to_signal(self, tmp_path, monkeypatch):
+        token_file = tmp_path / "relay.token"
+        token_file.write_text("secret-token\n")
+        monkeypatch.setenv("SIGNAL_ACCOUNT", "+15550000001")
+
+        job = {
+            "id": "weather",
+            "name": "Morning weather",
+            "deliver": "origin",
+            "origin": {"platform": "signal", "chat_id": "+15550000001"},
+        }
+        signal_send = AsyncMock(return_value={"success": True})
+        with patch("cron.scheduler.load_config", return_value=self._notification_cfg(token_file)), \
+             patch("gateway.config.load_gateway_config", return_value=self._gateway_cfg()), \
+             patch("urllib.request.urlopen", side_effect=OSError("relay down")), \
+             patch("tools.send_message_tool._send_to_platform", new=signal_send):
+            assert _deliver_result(job, "Clear and mild.") is None
+
+        signal_send.assert_called_once()
+
+    def test_non_self_signal_target_stays_on_signal(self, tmp_path, monkeypatch):
+        token_file = tmp_path / "relay.token"
+        token_file.write_text("secret-token\n")
+        monkeypatch.setenv("SIGNAL_ACCOUNT", "+15550000001")
+
+        job = {
+            "id": "other-person",
+            "deliver": "origin",
+            "origin": {"platform": "signal", "chat_id": "+15550000002"},
+        }
+        signal_send = AsyncMock(return_value={"success": True})
+        with patch("cron.scheduler.load_config", return_value=self._notification_cfg(token_file)), \
+             patch("gateway.config.load_gateway_config", return_value=self._gateway_cfg()), \
+             patch("urllib.request.urlopen") as urlopen_mock, \
+             patch("tools.send_message_tool._send_to_platform", new=signal_send):
+            assert _deliver_result(job, "Hello.") is None
+
+        urlopen_mock.assert_not_called()
+        signal_send.assert_called_once()
+
+
 class TestDeliverResultErrorReturns:
     """Verify _deliver_result returns error strings on failure, None on success."""
 
