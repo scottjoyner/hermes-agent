@@ -1,3 +1,9 @@
+<!-- repo-entrypoint-guide:start -->
+> **Repository context:** This README documents the Nous Research Hermes Agent project, including its official installation site and community links. This checkout is hosted at `scottjoyner/hermes-agent`; upstream badges and releases do not establish the state of this copy.
+> 
+> **Integration safety:** Agent tools may execute commands or access credentials. Check the current authorization model, configuration, installation scripts, and permission boundaries before connecting a local fleet or giving a worker write access.
+<!-- repo-entrypoint-guide:end -->
+
 <p align="center">
   <img src="assets/banner.png" alt="Hermes Agent" width="100%">
 </p>
