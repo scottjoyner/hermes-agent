@@ -184,3 +184,48 @@ def test_schema_change_fails_closed(tmp_path):
     journal.path.write_text(json.dumps(record) + "\n", encoding="utf-8")
     with pytest.raises(TraceReceiptError):
         verify_journal(journal.path)
+
+
+
+def test_symlink_journal_rejected_without_touching_target(tmp_path):
+    target = tmp_path / "unrelated.txt"
+    target.write_text("synthetic sentinel", encoding="utf-8")
+    journal = _journal(tmp_path)
+    journal.path.parent.mkdir()
+    journal.path.symlink_to(target)
+    with pytest.raises(TraceReceiptError, match="symlink"):
+        verify_journal(journal.path)
+    with pytest.raises(TraceReceiptError, match="symlink"):
+        journal.record("turn.start", {"n": 1}, source="hermes.observer")
+    assert target.read_text(encoding="utf-8") == "synthetic sentinel"
+
+
+def test_symlink_journal_parent_rejected(tmp_path):
+    actual_directory = tmp_path / "other"
+    actual_directory.mkdir()
+    (tmp_path / "traces").symlink_to(actual_directory, target_is_directory=True)
+    journal = _journal(tmp_path)
+    with pytest.raises(TraceReceiptError, match="symlink"):
+        verify_journal(journal.path)
+    with pytest.raises(TraceReceiptError, match="symlink"):
+        journal.record("turn.start", {"n": 1}, source="hermes.observer")
+    assert list(actual_directory.iterdir()) == []
+
+
+def test_short_os_writes_are_completed_before_fsync(tmp_path, monkeypatch):
+    real_write = os.write
+    def write_short(fd, chunk):
+        return real_write(fd, chunk[:7])
+    monkeypatch.setattr(os, "write", write_short)
+    journal = _journal(tmp_path)
+    receipt = journal.record("turn.start", {"n": 1}, source="hermes.observer")
+    assert receipt["sequence"] == 1
+    assert verify_journal(journal.path)["records"] == 1
+
+
+def test_zero_progress_write_reports_failure(tmp_path, monkeypatch):
+    monkeypatch.setattr(os, "write", lambda _fd, _chunk: 0)
+    journal = _journal(tmp_path)
+    with pytest.raises(TraceReceiptError, match="append failed"):
+        journal.record("turn.start", {"n": 1}, source="hermes.observer")
+    assert verify_journal(journal.path)["records"] == 0

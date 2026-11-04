@@ -206,6 +206,11 @@ def verify_journal(path: Path) -> Dict[str, Any]:
     further, do not trust prior contents).
     """
     path = Path(path)
+    # Never follow an attacker-controlled journal leaf or immediate directory
+    # symlink; both would redirect audit reads/writes away from the requested
+    # storage path. O_NOFOLLOW also guards the leaf at the actual open() call.
+    if path.is_symlink() or path.parent.is_symlink():
+        raise TraceReceiptError("trace receipt journal symlink redirection refused")
     if not path.exists():
         return {"records": 0, "sources": {}, "path": str(path)}
     sequences: Dict[str, int] = {}
@@ -249,6 +254,8 @@ class TraceReceiptJournal:
         # journal is capped at MAX_JOURNAL_BYTES, so this stays cheap.
         self._sequences = {}
         self._prev_receipt_id = None
+        if self.path.is_symlink() or self.path.parent.is_symlink():
+            raise TraceReceiptError("trace receipt journal symlink redirection refused")
         if self.path.exists():
             size = self.path.stat().st_size
             if size > MAX_JOURNAL_BYTES:
@@ -279,6 +286,8 @@ class TraceReceiptJournal:
         provenance or payload safety fails closed.
         """
         with _LOCK:
+            if self.path.is_symlink() or self.path.parent.is_symlink():
+                raise TraceReceiptError("trace receipt journal symlink redirection refused")
             self._load()
             source = _validate_source(source)
             kind = _validate_kind(kind)
@@ -299,21 +308,27 @@ class TraceReceiptJournal:
             record["receipt_id"] = _sha256_hex(_record_hash_input(record))
             line = _canonical_json(record) + "\n"
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            fd = os.open(
-                self.path,
-                os.O_WRONLY | os.O_CREAT | os.O_APPEND,
-                0o600,
-            )
             try:
-                os.write(fd, line.encode("utf-8"))
-                os.fsync(fd)
-            finally:
-                os.close(fd)
-            # chmod in case the file pre-existed with broader permissions.
-            try:
-                os.chmod(self.path, 0o600)
-            except OSError:
-                logger.debug("trace receipt chmod failed", exc_info=True)
+                fd = os.open(
+                    self.path,
+                    os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW,
+                    0o600,
+                )
+                try:
+                    # Secure the actual opened inode, not a path that could be
+                    # swapped to a symlink between write and chmod.
+                    os.fchmod(fd, 0o600)
+                    remaining = memoryview(line.encode("utf-8"))
+                    while remaining:
+                        written = os.write(fd, remaining)
+                        if written <= 0:
+                            raise OSError("journal write made no progress")
+                        remaining = remaining[written:]
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
+            except OSError as exc:
+                raise TraceReceiptError("trace receipt journal append failed") from exc
             self._sequences[source] = sequence
             self._prev_receipt_id = record["receipt_id"]
             return {
