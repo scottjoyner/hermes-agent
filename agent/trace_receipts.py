@@ -34,11 +34,16 @@ configuration.
 from __future__ import annotations
 
 import hashlib
+from contextlib import contextmanager
 import json
 import logging
 import os
 import re
 import threading
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows has no POSIX flock
+    fcntl = None
 import time
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple
@@ -84,6 +89,47 @@ _LOCK = threading.Lock()
 
 class TraceReceiptError(Exception):
     """Raised when a record (or the journal itself) fails closed."""
+
+
+@contextmanager
+def _journal_process_lock(path: Path) -> Iterator[None]:
+    """Bounded cross-process lock covering verify/sequence calculation/append.
+
+    The lock is separate from the JSONL leaf so opening it cannot truncate or
+    mutate receipts. A symlink lock leaf or journal directory fails closed.
+    Crash exits release POSIX flock automatically; Windows refuses writes
+    until a separately reviewed native lock implementation exists.
+    """
+    if fcntl is None:
+        raise TraceReceiptError("POSIX journal process lock unavailable")
+    if path.is_symlink() or path.parent.is_symlink():
+        raise TraceReceiptError("trace receipt journal symlink redirection refused")
+    lock_path = path.with_name(path.name + ".lock")
+    if lock_path.is_symlink():
+        raise TraceReceiptError("trace receipt journal lock symlink refused")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    except OSError as exc:
+        raise TraceReceiptError("trace receipt journal lock could not be opened") from exc
+    acquired = False
+    try:
+        os.fchmod(fd, 0o600)
+        deadline = time.monotonic() + 5.0
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+                break
+            except BlockingIOError as exc:
+                if time.monotonic() >= deadline:
+                    raise TraceReceiptError("trace receipt journal lock timed out") from exc
+                time.sleep(0.02)
+        yield
+    finally:
+        if acquired:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
 
 
 def default_journal_path() -> Path:
@@ -285,7 +331,7 @@ class TraceReceiptJournal:
         Raises :class:`TraceReceiptError` (and writes nothing) when
         provenance or payload safety fails closed.
         """
-        with _LOCK:
+        with _LOCK, _journal_process_lock(self.path):
             if self.path.is_symlink() or self.path.parent.is_symlink():
                 raise TraceReceiptError("trace receipt journal symlink redirection refused")
             self._load()
@@ -344,7 +390,7 @@ class TraceReceiptJournal:
 
     def records_for_source(self, source: str) -> List[Dict[str, Any]]:
         """Return parsed records for one source (verification-grade read)."""
-        with _LOCK:
+        with _LOCK, _journal_process_lock(self.path):
             self._load()
             source = _validate_source(source)
             if not self.path.exists():
