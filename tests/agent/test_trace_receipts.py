@@ -5,8 +5,10 @@ production paths — the journal is exercised against tmp_path only.
 """
 
 import json
+import multiprocessing
 import os
 import stat
+from pathlib import Path
 
 import pytest
 
@@ -17,6 +19,14 @@ from agent.trace_receipts import (
     TraceReceiptJournal,
     verify_journal,
 )
+
+
+def _record_in_process(path, start, count, ready):
+    """Synthetic process child: no network, credentials or production state."""
+    ready.wait(timeout=5)
+    journal = TraceReceiptJournal(Path(path))
+    for index in range(start, start + count):
+        journal.record("turn.synthetic", {"index": index}, source="hermes.observer")
 
 
 def _journal(tmp_path):
@@ -229,3 +239,44 @@ def test_zero_progress_write_reports_failure(tmp_path, monkeypatch):
     with pytest.raises(TraceReceiptError, match="append failed"):
         journal.record("turn.start", {"n": 1}, source="hermes.observer")
     assert verify_journal(journal.path)["records"] == 0
+
+def test_multiple_processes_preserve_single_hash_chain(tmp_path):
+    if "fork" not in multiprocessing.get_all_start_methods():
+        pytest.skip("POSIX fork required for synthetic cross-process receipt test")
+    ctx = multiprocessing.get_context("fork")
+    event = ctx.Event()
+    path = tmp_path / "traces" / "shared.jsonl"
+    workers = [
+        ctx.Process(target=_record_in_process, args=(str(path), i * 7, 7, event))
+        for i in range(3)
+    ]
+    try:
+        for proc in workers:
+            proc.start()
+        event.set()
+        for proc in workers:
+            proc.join(timeout=10)
+        assert all(p.exitcode == 0 for p in workers), [p.exitcode for p in workers]
+    finally:
+        for proc in workers:
+            if proc.is_alive():
+                proc.terminate()
+                proc.join(timeout=5)
+    summary = verify_journal(path)
+    assert summary["records"] == 21
+    assert summary["sources"] == {"hermes.observer": 21}
+    records = TraceReceiptJournal(path).records_for_source("hermes.observer")
+    assert [r["sequence"] for r in records] == list(range(1, 22))
+    assert len({r["receipt_id"] for r in records}) == 21
+
+
+def test_journal_lock_symlink_rejected_without_appending(tmp_path):
+    journal = _journal(tmp_path)
+    journal.path.parent.mkdir(parents=True)
+    destination = tmp_path / "synthetic-target.txt"
+    destination.write_text("unaltered", encoding="utf-8")
+    journal.path.with_name(journal.path.name + ".lock").symlink_to(destination)
+    with pytest.raises(TraceReceiptError, match="lock symlink"):
+        journal.record("turn.synthetic", {"n": 1}, source="hermes.observer")
+    assert destination.read_text(encoding="utf-8") == "unaltered"
+    assert not journal.path.exists()
