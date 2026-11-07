@@ -280,3 +280,22 @@ def test_journal_lock_symlink_rejected_without_appending(tmp_path):
         journal.record("turn.synthetic", {"n": 1}, source="hermes.observer")
     assert destination.read_text(encoding="utf-8") == "unaltered"
     assert not journal.path.exists()
+
+
+def test_valid_prefix_does_not_prove_original_tail_completeness(tmp_path):
+    """A valid local hash chain alone cannot detect suffix deletion.
+
+    The missing receipt requires an externally pinned head/record count to
+    establish a rollback violation. This is a documented security boundary,
+    not a passed anti-rollback proof.
+    """
+    journal = _journal(tmp_path)
+    journal.record("turn.start", {"n": 1}, source="hermes.observer")
+    journal.record("turn.end", {"n": 2}, source="hermes.observer")
+    lines = journal.path.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 2
+
+    journal.path.write_text(lines[0] + "\n", encoding="utf-8")
+    summary = verify_journal(journal.path)
+    assert summary["records"] == 1
+    assert summary["sources"] == {"hermes.observer": 1}

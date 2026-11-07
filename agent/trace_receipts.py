@@ -13,8 +13,11 @@ This module provides a small append-only journal that:
 - assigns a monotonic per-source ``sequence`` number that survives
   process restarts (rebuilt by scanning the existing journal);
 - hash-chains records (``prev_receipt_id``) and content-hashes payloads
-  (``payload_sha256``) so tampering or truncation is detectable via
-  :func:`verify_journal`;
+  (``payload_sha256``) so interior corruption, missing prefixes and
+  broken links are detected by :func:`verify_journal`. A coherent prefix
+  remains valid after *tail deletion*, and an attacker able to rewrite the
+  entire file can recompute this unkeyed chain. Completeness, authenticity
+  and anti-rollback need a separately trusted pinned head/receipt;
 - rejects payloads that are not JSON objects, exceed a bounded size, or
   carry credential-looking keys anywhere in the tree (fail-closed
   payload safety, mirroring the observer contract's redaction stance);

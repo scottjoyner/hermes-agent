@@ -105,3 +105,12 @@ TESTS: `PYTHONDONTWRITEBYTECODE=1 python3 -m pytest -q -p no:cacheprovider tests
 - Source HEAD verified as `e04d716bc7` (`fix(trace): serialize receipt appends across processes`). No production Hermes tracing hooks enabled and no real recordings or provider traffic accessed.
 - This confirms the focused local test suite, not independent crash-recovery custody, an off-host signed witness or SensorGraft ingestion acceptance.
 - Do not deploy, federate, purge or enable journals without an approved consumer schema, independent anti-rollback custody and separate production admission.
+
+## November 6 continuation — independent synthetic CI gate and honest rollback boundary
+
+STATUS: PASS (offline unit tests; production integration HOLD)
+TESTS: `PYTHONDONTWRITEBYTECODE=1 python3 -m pytest -q -p no:cacheprovider tests/agent/test_trace_receipts.py` -> **33 passed, 0 failed** on x1-370. New `.github/workflows/trace-receipts-research.yml` parsed with PyYAML and passed local structural permission/path checks.
+
+- Added a narrowly scoped pull-request/workflow-dispatch action: read-only repository permissions, non-persistent checkout credentials, pinned checkout/setup-python action SHAs, Python 3.11, pytest 9.0.2, and the focused receipt test file only. No production deployment, external credentials, or network/model traffic in tests.
+- Reworded journal primitive documentation: local unkeyed hash chains detect broken interior links and payload tampering but **cannot** detect deletion of a valid trailing suffix, or complete rewrite/re-hashing, without a separately pinned trusted head. Added a synthetic regression proving a retained coherent prefix remains locally verifiable after tail deletion.
+- Do not infer external anti-rollback, signed custody, per-host chain completeness or approval to wire the journal from a passing suite. Next gate is actual hosted CI at the exact revised PR head plus an independently reviewed consumer/custody spec.
