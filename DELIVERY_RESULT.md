@@ -114,3 +114,12 @@ TESTS: `PYTHONDONTWRITEBYTECODE=1 python3 -m pytest -q -p no:cacheprovider tests
 - Added a narrowly scoped pull-request/workflow-dispatch action: read-only repository permissions, non-persistent checkout credentials, pinned checkout/setup-python action SHAs, Python 3.11, pytest 9.0.2, and the focused receipt test file only. No production deployment, external credentials, or network/model traffic in tests.
 - Reworded journal primitive documentation: local unkeyed hash chains detect broken interior links and payload tampering but **cannot** detect deletion of a valid trailing suffix, or complete rewrite/re-hashing, without a separately pinned trusted head. Added a synthetic regression proving a retained coherent prefix remains locally verifiable after tail deletion.
 - Do not infer external anti-rollback, signed custody, per-host chain completeness or approval to wire the journal from a passing suite. Next gate is actual hosted CI at the exact revised PR head plus an independently reviewed consumer/custody spec.
+
+## November 6 continuation — ancestor-path traversal hardening
+
+STATUS: PASS (synthetic validation only; production wiring HOLD)
+TESTS: 35 passed, 0 failed with local `python3 -m pytest -q -p no:cacheprovider tests/agent/test_trace_receipts.py`; 35 passed, 0 failed independently in a cached application Python image with `docker --pull never --network none --read-only --cap-drop ALL --security-opt no-new-privileges --memory 1g --cpus 2` and read-only source/pytest mounts.
+
+- New `_refuse_path_symlinks` checks the lexical path and all ancestors for pre-existing symlink components before journal reads, process locking, and writes. Parent `..` traversal components are refused before normalization; two new synthetic tests prove no writes through a symlink grandparent or `..` path.
+- This is static preflight only: concurrent ancestor symlink swaps (TOCTOU), trusted journal directory ownership, independently pinned final chain tip and valid suffix rollback remain unresolved. Do not enable Hermes production hooks or claim full filesystem path custody.
+- Github Actions registered workflows do not yet expose the new PR-only synthetic workflow; zero hosted runs at previous exact head `0930139b226b5957a894e6ae7e215dd3f16dda7a`. Require independent executed exact-head CI before approval; local and isolated Docker success do not substitute.

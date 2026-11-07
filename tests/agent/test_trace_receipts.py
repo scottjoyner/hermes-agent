@@ -299,3 +299,29 @@ def test_valid_prefix_does_not_prove_original_tail_completeness(tmp_path):
     summary = verify_journal(journal.path)
     assert summary["records"] == 1
     assert summary["sources"] == {"hermes.observer": 1}
+
+
+def test_symlink_grandparent_is_rejected_without_writing(tmp_path):
+    """Static ancestor checks must cover more than the immediate parent."""
+    actual_root = tmp_path / "actual"
+    actual_root.mkdir()
+    link_root = tmp_path / "alias"
+    link_root.symlink_to(actual_root, target_is_directory=True)
+    journal = TraceReceiptJournal(link_root / "traces" / "receipts.jsonl")
+    with pytest.raises(TraceReceiptError, match="symlink"):
+        verify_journal(journal.path)
+    with pytest.raises(TraceReceiptError, match="symlink"):
+        journal.record("turn.synthetic", {"n": 1}, source="hermes.observer")
+    assert list(actual_root.iterdir()) == []
+
+
+def test_parent_dotdot_path_is_rejected_before_writing(tmp_path):
+    """Do not normalize away traversal before checking path components."""
+    actual_root = tmp_path / "actual"
+    actual_root.mkdir()
+    journal = TraceReceiptJournal(actual_root / "traces" / ".." / "receipts.jsonl")
+    with pytest.raises(TraceReceiptError, match="traversal"):
+        verify_journal(journal.path)
+    with pytest.raises(TraceReceiptError, match="traversal"):
+        journal.record("turn.synthetic", {"n": 1}, source="hermes.observer")
+    assert list(actual_root.iterdir()) == []

@@ -94,6 +94,20 @@ class TraceReceiptError(Exception):
     """Raised when a record (or the journal itself) fails closed."""
 
 
+def _refuse_path_symlinks(path: Path) -> None:
+    """Reject symlink components, not just the journal and its direct parent.
+
+    This is a static safety check, not a defense against concurrent ancestor
+    swaps; a production integration also needs trusted directory custody.
+    """
+    if ".." in path.parts:
+        raise TraceReceiptError("trace receipt journal parent traversal refused")
+    absolute = Path(os.path.abspath(path))  # Do not resolve symlink components.
+    for component in (absolute, *absolute.parents):
+        if component.is_symlink():
+            raise TraceReceiptError("trace receipt journal symlink redirection refused")
+
+
 @contextmanager
 def _journal_process_lock(path: Path) -> Iterator[None]:
     """Bounded cross-process lock covering verify/sequence calculation/append.
@@ -105,8 +119,7 @@ def _journal_process_lock(path: Path) -> Iterator[None]:
     """
     if fcntl is None:
         raise TraceReceiptError("POSIX journal process lock unavailable")
-    if path.is_symlink() or path.parent.is_symlink():
-        raise TraceReceiptError("trace receipt journal symlink redirection refused")
+    _refuse_path_symlinks(path)
     lock_path = path.with_name(path.name + ".lock")
     if lock_path.is_symlink():
         raise TraceReceiptError("trace receipt journal lock symlink refused")
@@ -258,8 +271,7 @@ def verify_journal(path: Path) -> Dict[str, Any]:
     # Never follow an attacker-controlled journal leaf or immediate directory
     # symlink; both would redirect audit reads/writes away from the requested
     # storage path. O_NOFOLLOW also guards the leaf at the actual open() call.
-    if path.is_symlink() or path.parent.is_symlink():
-        raise TraceReceiptError("trace receipt journal symlink redirection refused")
+    _refuse_path_symlinks(path)
     if not path.exists():
         return {"records": 0, "sources": {}, "path": str(path)}
     sequences: Dict[str, int] = {}
@@ -303,8 +315,7 @@ class TraceReceiptJournal:
         # journal is capped at MAX_JOURNAL_BYTES, so this stays cheap.
         self._sequences = {}
         self._prev_receipt_id = None
-        if self.path.is_symlink() or self.path.parent.is_symlink():
-            raise TraceReceiptError("trace receipt journal symlink redirection refused")
+        _refuse_path_symlinks(self.path)
         if self.path.exists():
             size = self.path.stat().st_size
             if size > MAX_JOURNAL_BYTES:
@@ -335,8 +346,7 @@ class TraceReceiptJournal:
         provenance or payload safety fails closed.
         """
         with _LOCK, _journal_process_lock(self.path):
-            if self.path.is_symlink() or self.path.parent.is_symlink():
-                raise TraceReceiptError("trace receipt journal symlink redirection refused")
+            _refuse_path_symlinks(self.path)
             self._load()
             source = _validate_source(source)
             kind = _validate_kind(kind)
