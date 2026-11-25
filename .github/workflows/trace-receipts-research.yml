@@ -1,0 +1,37 @@
+name: Trace receipt research (synthetic only)
+
+on:
+  pull_request:
+    paths:
+      - agent/trace_receipts.py
+      - tests/agent/test_trace_receipts.py
+      - .github/workflows/trace-receipts-research.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  synthetic-receipt-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout reviewed source without persistent credentials
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Set up supported Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: '3.11'
+      - name: Install minimal test dependency
+        run: python -m pip install --disable-pip-version-check pytest==9.0.2
+      - name: Verify source and focused synthetic receipts
+        env:
+          PYTHONDONTWRITEBYTECODE: '1'
+          OPENAI_API_KEY: ''
+          OPENROUTER_API_KEY: ''
+          NOUS_API_KEY: ''
+        run: |
+          python -m py_compile agent/trace_receipts.py tests/agent/test_trace_receipts.py
+          python -m pytest -q -p no:cacheprovider tests/agent/test_trace_receipts.py
