@@ -5881,6 +5881,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 fb = get_fallback_chain(cfg)
                 if fb:
                     return fb
+                logger.warning(
+                    "No fallback_providers configured: transient failures of a "
+                    "local-only provider will be retried but not failed over"
+                )
         except Exception:
             pass
         return None
