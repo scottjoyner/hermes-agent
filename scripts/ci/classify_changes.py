@@ -25,7 +25,9 @@ must never skip one a change could break:
 
 * An empty diff, or any ``.github/`` change, runs everything.
 * ``python`` is a denylist: skipped only when *every* file is provably prose
-  or a frontend-only package; an unrecognized path keeps it on.
+  or a frontend-only package; an unrecognized path keeps it on. Python source
+  (``.py``/``.pyi``/``.pth``) is never provably prose, even under a skipped
+  prefix — the repo ships real Python under ``website/scripts/``.
 * ``skills/`` (incl. ``SKILL.md``) is python-relevant — the skill-doc tests
   read that tree, so a doc-looking edit can still break Python.
 """
@@ -60,6 +62,16 @@ _CI_REVIEW_PATHS = (".github/workflows/", ".github/actions/")
 _SCAN_EXTS = (".py", ".pth")
 _SCAN_FILES = {"setup.cfg", "pyproject.toml"}
 
+# A source/importable file is never "provably prose or a frontend-only
+# package", even when it lives under a tree that is otherwise skipped. The
+# repo ships real Python under `website/scripts/` (e.g.
+# generate-skill-docs.py), and docs/frontend/docker trees can carry helper
+# scripts too. Classifying those as irrelevant skipped the Python CI lane —
+# pytest/ruff/footguns — for code that is executed by CI. `.pyi` stubs and
+# `.pth` install-time hooks belong here as well: they are Python source, not
+# prose. Keep this check ahead of every prefix-based skip below.
+_PY_SOURCE_EXTS = (".py", ".pyi", ".pth")
+
 # MCP catalog files that require explicit security review.
 _MCP_CATALOG_PATHS = ("optional-mcps/",)
 _MCP_CATALOG_FILES = {"hermes_cli/mcp_catalog.py"}
@@ -71,6 +83,10 @@ def _is_docs(p: str) -> bool:
 
 
 def _py_irrelevant(p: str) -> bool:
+    # Fail closed: executable/type-checkable Python is never irrelevant,
+    # regardless of which prose/frontend tree it lives under.
+    if p.endswith(_PY_SOURCE_EXTS):
+        return False
     return _is_docs(p) or p in _ROOT_NPM or p.startswith(_PY_SKIP) or p.startswith(_DOCKER_META)
 
 
