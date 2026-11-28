@@ -366,7 +366,23 @@ def _canonical_skills(skill: Optional[str] = None, skills: Optional[Any] = None)
     normalized: List[str] = []
     for item in raw_items:
         text = str(item or "").strip()
-        if text and text not in normalized:
+        if not text:
+            continue
+        # Some legacy jobs stored a JSON-encoded array inside a string (e.g.
+        # '["portfolio-ops"]'). Treat it as the list it represents rather than
+        # as one literal skill name. Plain strings keep working unchanged.
+        if text.startswith("[") and text.endswith("]"):
+            try:
+                decoded = json.loads(text)
+            except (TypeError, ValueError):
+                decoded = None
+            if isinstance(decoded, list):
+                for entry in decoded:
+                    name = str(entry or "").strip()
+                    if name and name not in normalized:
+                        normalized.append(name)
+                continue
+        if text not in normalized:
             normalized.append(text)
     return normalized
 
